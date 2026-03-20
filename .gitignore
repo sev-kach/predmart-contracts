@@ -1,0 +1,20 @@
+# contracts/.gitignore
+cache/
+out/
+deploy_cache/
+foundry.toml.bak
+node_modules/
+broadcast/
+
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.testnet
+.env.mainnet
+
+# Keep broadcast folder structure but ignore local chain and dry runs
+!/broadcast
+/broadcast/*/31337/
+/broadcast/**/dry-run/
