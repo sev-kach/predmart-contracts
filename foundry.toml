@@ -1,0 +1,32 @@
+# contracts/foundry.toml
+# IMPORTANT: solc must be >= 0.8.27 for Polygonscan verification with via_ir.
+# Solc 0.8.24 has a non-determinism bug in the Yul IR pipeline (AST ID-dependent identifiers)
+# that causes bytecode mismatch between local and Polygonscan server-side compilation.
+# See: https://github.com/ethereum/solidity/issues/14541
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.27"
+optimizer = true
+optimizer_runs = 1
+via_ir = true
+ffi = true
+gas_reports = ["*"]
+
+[profile.default.fuzz]
+runs = 256
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = true
+wrap_comments = true
+
+[rpc_endpoints]
+polygon_amoy = "${POLYGON_AMOY_RPC_URL}"
+polygon_mainnet = "${POLYGON_MAINNET_RPC_URL}"
+
+[etherscan]
+polygon_amoy = { key = "${POLYGONSCAN_API_KEY}", url = "https://api-amoy.polygonscan.com/api" }
+polygon_mainnet = { key = "${POLYGONSCAN_API_KEY}", url = "https://api.polygonscan.com/api" }
