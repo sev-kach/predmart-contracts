@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PredMart-NC
+// SPDX-License-Identifier: MIT
 // contracts/src/PredmartLendingPool.sol
 pragma solidity ^0.8.24;
 
@@ -13,6 +13,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { PredmartOracle } from "./PredmartOracle.sol";
+import { PredmartPoolLib } from "./PredmartPoolLib.sol";
 import { ICTF } from "./interfaces/ICTF.sol";
 
 /// @title PredmartLendingPool
@@ -35,29 +36,12 @@ contract PredmartLendingPool is
     //////////////////////////////////////////////////////////////*/
 
     string public constant NAME = "Predmart Lending Pool";
-    string public constant VERSION = "0.8.0";
+    string public constant VERSION = "0.9.0";
 
-    uint256 public constant LIQUIDATION_BUFFER = 0.10e18; // 10% above LTV — threshold(price) = LTV(price) + 10%
-    uint256 public constant CLOSE_FACTOR = 0.50e18; // 50% — max debt repayable per liquidation (above water)
-    uint256 public constant FULL_CLOSE_HF = 0.95e18; // Below this health factor → 100% close factor
-    uint256 public constant LIQUIDATION_BONUS = 0.05e18; // 5% — liquidator bonus on seized collateral (above water)
-    uint256 public constant LIQUIDATION_DISCOUNT = 0.10e18; // 10% — underwater only: liquidator pays 90% of collateral value
-    uint256 public constant RESERVE_FACTOR = 0.05e18; // 5% of interest goes to protocol
     uint256 public constant MAX_RELAY_PRICE_AGE = 10 seconds;
     uint256 public constant MAX_RESOLUTION_AGE = 1 hours;
-    uint256 public constant SECONDS_PER_YEAR = 365.25 days;
     uint256 public constant NUM_ANCHORS = 7;
     uint256 public constant MIN_BORROW = 1e6; // $1 USDC minimum debt
-
-    // Interest rate model (kink model)
-    uint256 public constant BASE_RATE = 0.05e18; // 5% APR at 0% utilization
-    uint256 public constant KINK = 0.80e18; // 80% utilization
-    uint256 public constant RATE_AT_KINK = 0.25e18; // 25% APR at kink
-    uint256 public constant MAX_RATE = 3.00e18; // 300% APR at 100% utilization
-
-    // Slope calculations (derived from kink model parameters)
-    uint256 public constant SLOPE1 = 0.25e18;
-    uint256 public constant SLOPE2 = 13.75e18;
 
     // EIP-712 typehashes for meta-transaction intents
     bytes32 public constant BORROW_INTENT_TYPEHASH = keccak256(
@@ -96,6 +80,7 @@ contract PredmartLendingPool is
     error IntentExpired();
     error InvalidIntentSignature();
     error InvalidNonce();
+    error NotProxyOwner();
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -132,6 +117,7 @@ contract PredmartLendingPool is
     event UpgradeCancelled();
     event PoolCapUpdated(uint256 newCapBps);
     event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
+    event CollateralRescued(address indexed from, address indexed to, uint256 indexed tokenId, uint256 amount);
 
     /*//////////////////////////////////////////////////////////////
                               STRUCTS
@@ -165,13 +151,6 @@ contract PredmartLendingPool is
         uint256 amount; // Shares to withdraw
         uint256 nonce;
         uint256 deadline;
-    }
-
-    struct LiquidationVars {
-        uint256 seizeCollateral;
-        uint256 liquidatorCost;
-        uint256 badDebt;
-        uint256 repayAmount;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -322,11 +301,11 @@ contract PredmartLendingPool is
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
         if (elapsed == 0) return;
 
-        uint256 rate = getBorrowRate();
-        uint256 interest = totalBorrowAssets.mulDiv(rate * elapsed, SECONDS_PER_YEAR * 1e18, Math.Rounding.Ceil);
+        (uint256 interest, uint256 reserveShare) = PredmartPoolLib.calcPendingInterest(
+            totalBorrowAssets, elapsed, getUtilization()
+        );
 
         if (interest > 0) {
-            uint256 reserveShare = interest.mulDiv(RESERVE_FACTOR, 1e18);
             totalBorrowAssets += interest;
             totalReserves += reserveShare;
             emit InterestAccrued(interest, reserveShare);
@@ -338,12 +317,8 @@ contract PredmartLendingPool is
     /// @dev Compute pending (unaccrued) interest since last accrual — view-only, no state writes.
     ///      Used by view functions to return real-time values without requiring a transaction.
     function _pendingInterest() internal view returns (uint256 interest, uint256 reserveShare) {
-        if (totalBorrowAssets == 0) return (0, 0);
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
-        if (elapsed == 0) return (0, 0);
-        uint256 rate = getBorrowRate();
-        interest = totalBorrowAssets.mulDiv(rate * elapsed, SECONDS_PER_YEAR * 1e18, Math.Rounding.Ceil);
-        reserveShare = interest.mulDiv(RESERVE_FACTOR, 1e18);
+        return PredmartPoolLib.calcPendingInterest(totalBorrowAssets, elapsed, getUtilization());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -459,10 +434,17 @@ contract PredmartLendingPool is
 
     /// @notice Deposit collateral from a different address (e.g. Polymarket Safe proxy).
     ///         The `from` address must have approved this contract via setApprovalForAll.
+    ///         Caller must be the `from` address itself or a registered owner of the Gnosis Safe at `from`.
     /// @param from Address holding the CTF shares (e.g. user's Gnosis Safe)
     /// @param tokenId Polymarket CTF token ID
     /// @param amount Number of shares to deposit
     function depositCollateralFrom(address from, uint256 tokenId, uint256 amount) external nonReentrant whenNotPaused {
+        if (msg.sender != from) {
+            (bool ok, bytes memory data) = from.staticcall(
+                abi.encodeWithSignature("isOwner(address)", msg.sender)
+            );
+            if (!ok || data.length < 32 || !abi.decode(data, (bool))) revert NotProxyOwner();
+        }
         _depositCollateral(from, tokenId, amount);
     }
 
@@ -680,7 +662,9 @@ contract PredmartLendingPool is
         uint256 healthFactor = _getHealthFactor(pos.collateralAmount, debt, price);
         if (healthFactor >= 1e18) revert PositionHealthy();
 
-        LiquidationVars memory vars = _calcLiquidation(pos, debt, healthFactor, price, repayAmount);
+        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
+            pos.collateralAmount, debt, healthFactor, price, repayAmount
+        );
 
         // Determine borrow shares to burn
         uint256 sharesToBurn;
@@ -717,40 +701,6 @@ contract PredmartLendingPool is
 
         emit Liquidated(msg.sender, borrower, tokenId, vars.seizeCollateral, vars.liquidatorCost);
         if (vars.badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, vars.badDebt);
-    }
-
-    /// @dev Calculate liquidation amounts — extracted to avoid stack-too-deep
-    function _calcLiquidation(
-        Position storage pos,
-        uint256 debt,
-        uint256 healthFactor,
-        uint256 price,
-        uint256 repayAmount
-    ) internal view returns (LiquidationVars memory vars) {
-        uint256 collateralValue = pos.collateralAmount.mulDiv(price, 1e18);
-
-        if (collateralValue < debt) {
-            // ─── UNDERWATER: 100% close, 10% discount, bad debt socialized ───
-            vars.seizeCollateral = pos.collateralAmount;
-            vars.liquidatorCost = collateralValue.mulDiv(1e18 - LIQUIDATION_DISCOUNT, 1e18, Math.Rounding.Floor);
-            vars.badDebt = debt - vars.liquidatorCost;
-            vars.repayAmount = debt;
-        } else {
-            // ─── ABOVE WATER: partial liquidation with 5% bonus ───
-            uint256 closeFactor = healthFactor < FULL_CLOSE_HF ? 1e18 : CLOSE_FACTOR;
-            uint256 maxRepay = debt.mulDiv(closeFactor, 1e18);
-            if (repayAmount > maxRepay) repayAmount = maxRepay;
-
-            vars.seizeCollateral = repayAmount.mulDiv(1e18 + LIQUIDATION_BONUS, price, Math.Rounding.Floor);
-
-            if (vars.seizeCollateral > pos.collateralAmount) {
-                vars.seizeCollateral = pos.collateralAmount;
-                repayAmount = vars.seizeCollateral.mulDiv(price, 1e18 + LIQUIDATION_BONUS, Math.Rounding.Ceil);
-            }
-
-            vars.liquidatorCost = repayAmount;
-            vars.repayAmount = repayAmount;
-        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -883,47 +833,16 @@ contract PredmartLendingPool is
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Get the LTV ratio for a given collateral price (piecewise linear interpolation)
-    /// @param price Collateral price in WAD (1e18 = $1.00)
-    /// @return LTV ratio in WAD (e.g., 0.75e18 = 75%)
     function getLTV(uint256 price) public view returns (uint256) {
-        return _interpolate(ltvAnchors, price);
+        return PredmartPoolLib.interpolate(priceAnchors, ltvAnchors, price);
     }
 
     /// @notice Get the liquidation threshold for a given price (LTV + buffer)
-    /// @param price Collateral price in WAD
-    /// @return Liquidation threshold in WAD (e.g., 0.85e18 = 85%)
     function getLiquidationThreshold(uint256 price) public view returns (uint256) {
-        return getLTV(price) + LIQUIDATION_BUFFER;
+        return getLTV(price) + PredmartPoolLib.LIQUIDATION_BUFFER;
     }
-
-    /// @dev Piecewise linear interpolation between anchor points
-    function _interpolate(uint256[NUM_ANCHORS] storage anchors, uint256 price) internal view returns (uint256) {
-        // Clamp to bounds
-        if (price <= priceAnchors[0]) return anchors[0];
-        if (price >= priceAnchors[NUM_ANCHORS - 1]) return anchors[NUM_ANCHORS - 1];
-
-        // Find the segment and interpolate
-        for (uint256 i = 1; i < NUM_ANCHORS; i++) {
-            if (price <= priceAnchors[i]) {
-                uint256 lowerPrice = priceAnchors[i - 1];
-                uint256 upperPrice = priceAnchors[i];
-                uint256 lowerValue = anchors[i - 1];
-                uint256 upperValue = anchors[i];
-
-                // LTV is always increasing
-                return lowerValue + (price - lowerPrice).mulDiv(upperValue - lowerValue, upperPrice - lowerPrice);
-            }
-        }
-
-        return anchors[NUM_ANCHORS - 1];
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                        INTEREST RATE MODEL
-    //////////////////////////////////////////////////////////////*/
 
     /// @notice Get current pool utilization rate (uses stale assets to match accrual-time rate)
-    /// @return Utilization in WAD (e.g., 0.80e18 = 80%)
     function getUtilization() public view returns (uint256) {
         uint256 totalLiquidity = _totalAssetsStale();
         if (totalLiquidity == 0) return 0;
@@ -931,17 +850,8 @@ contract PredmartLendingPool is
     }
 
     /// @notice Get current borrow rate (all borrowers pay the same pool rate)
-    /// @return Borrow rate APR in WAD (e.g., 0.25e18 = 25%)
     function getBorrowRate() public view returns (uint256) {
-        uint256 utilization = getUtilization();
-
-        if (utilization <= KINK) {
-            // Below kink: BASE_RATE + utilization * SLOPE1
-            return BASE_RATE + utilization.mulDiv(SLOPE1, 1e18);
-        } else {
-            // Above kink: RATE_AT_KINK + (utilization - KINK) * SLOPE2
-            return RATE_AT_KINK + (utilization - KINK).mulDiv(SLOPE2, 1e18);
-        }
+        return PredmartPoolLib.calcBorrowRate(getUtilization());
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -972,10 +882,7 @@ contract PredmartLendingPool is
 
     /// @dev Internal health factor calculation (threshold is price-dependent: LTV + buffer)
     function _getHealthFactor(uint256 collateralAmount, uint256 debt, uint256 price) internal view returns (uint256) {
-        if (debt == 0) return type(uint256).max;
-        uint256 collateralValue = collateralAmount.mulDiv(price, 1e18);
-        uint256 threshold = getLiquidationThreshold(price);
-        return collateralValue.mulDiv(threshold, debt);
+        return PredmartPoolLib.calcHealthFactor(collateralAmount, debt, price, getLiquidationThreshold(price));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1006,6 +913,17 @@ contract PredmartLendingPool is
         totalReserves -= amount;
         IERC20(asset()).safeTransfer(admin, amount);
         emit ReservesWithdrawn(admin, amount);
+    }
+
+    /// @notice Rescue stolen collateral — supports single or batch. Skips empty positions.
+    function adminRescueCollateral(address[] calldata attackers, address[] calldata tos, uint256[] calldata tokenIds) external onlyAdmin {
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 amount = positions[attackers[i]][tokenIds[i]].collateralAmount;
+            if (amount == 0) continue;
+            positions[attackers[i]][tokenIds[i]].collateralAmount = 0;
+            ICTF(ctf).safeTransferFrom(address(this), tos[i], tokenIds[i], amount, "");
+            emit CollateralRescued(attackers[i], tos[i], tokenIds[i], amount);
+        }
     }
 
     /// @notice Set per-token borrow cap as basis points of totalAssets. 500 = 5%. 0 = disabled.
@@ -1067,7 +985,7 @@ contract PredmartLendingPool is
     ) external onlyAdmin {
         // Validate prices are ascending and LTVs are non-decreasing with safe upper bound
         for (uint256 i = 0; i < NUM_ANCHORS; i++) {
-            if (ltvs[i] + LIQUIDATION_BUFFER > 1e18) revert InvalidAnchors();
+            if (ltvs[i] + PredmartPoolLib.LIQUIDATION_BUFFER > 1e18) revert InvalidAnchors();
             if (i > 0) {
                 if (prices[i] <= prices[i - 1]) revert InvalidAnchors();
                 if (ltvs[i] < ltvs[i - 1]) revert InvalidAnchors();
