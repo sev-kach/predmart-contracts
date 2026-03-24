@@ -35,8 +35,7 @@ contract PredmartLendingPool is
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    string public constant NAME = "Predmart Lending Pool";
-    string public constant VERSION = "0.9.0";
+    string internal constant VERSION = "0.9.1";
 
     uint256 public constant MAX_RELAY_PRICE_AGE = 10 seconds;
     uint256 public constant MAX_RESOLUTION_AGE = 1 hours;
@@ -65,14 +64,12 @@ contract PredmartLendingPool is
     error PositionHealthy();
     error ExceedsLTV();
     error InsufficientLiquidity();
-    error InvalidAnchors();
     error TokenFrozen();
     error TokenNotRedeemed();
     error AlreadyRedeemed();
     error RedemptionFailed();
     error TimelockNotReady();
     error NoPendingChange();
-    error TimelockCannotDecrease();
     error BorrowTooSmall();
     error ExceedsTokenCap();
     error DepthCapExceeded();
@@ -117,7 +114,7 @@ contract PredmartLendingPool is
     event UpgradeCancelled();
     event PoolCapUpdated(uint256 newCapBps);
     event RelayerUpdated(address indexed oldRelayer, address indexed newRelayer);
-    event CollateralRescued(address indexed from, address indexed to, uint256 indexed tokenId, uint256 amount);
+    event ExtensionUpdated(address indexed newExtension);
 
     /*//////////////////////////////////////////////////////////////
                               STRUCTS
@@ -127,6 +124,7 @@ contract PredmartLendingPool is
         uint256 collateralAmount; // ERC-1155 shares deposited
         uint256 borrowShares; // Shares of the global borrow pool owned by this position
         uint256 lastDepositTimestamp; // DEPRECATED — kept for storage layout compatibility
+        uint256 borrowedPrincipal; // v0.9.1 — cumulative USDC principal borrowed (for accurate per-token cap tracking)
     }
 
     struct MarketResolution {
@@ -215,6 +213,14 @@ contract PredmartLendingPool is
     address public relayer; // Trusted relayer address — only this address can call borrowViaRelay/withdrawViaRelay/liquidate
     mapping(address => uint256) public borrowNonces; // Per-user nonce for EIP-712 intent replay protection
 
+    // v0.9.1 — Timelocked relayer rotation + separate withdraw nonces
+    address public pendingRelayer;
+    uint256 public pendingRelayerExecAfter;
+    mapping(address => uint256) public withdrawNonces;
+    address public extension; // v0.9.1 — extension contract for admin functions (delegatecall target)
+    address public pendingAdmin; // v0.9.1 — timelocked admin transfer
+    uint256 public pendingAdminExecAfter;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -285,7 +291,7 @@ contract PredmartLendingPool is
                         GLOBAL INTEREST ACCRUAL
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Accrue interest on the entire borrow pool. Permissionless — updates state so views return fresh values.
+    /// @notice Accrue interest on the entire borrow pool. Permissionless.
     function accrueInterest() external {
         _accrueInterest();
     }
@@ -342,11 +348,13 @@ contract PredmartLendingPool is
     }
 
     /// @dev Reduce global borrow tracking (safe subtraction — floors at 0 for rounding edge cases)
-    function _reduceBorrowTracking(uint256 tokenId, uint256 assets, uint256 shares) internal {
+    function _reduceBorrowTracking(uint256 tokenId, uint256 assets, uint256 shares, uint256 principalReduction) internal {
         totalBorrowAssets = totalBorrowAssets > assets ? totalBorrowAssets - assets : 0;
         totalBorrowShares = totalBorrowShares > shares ? totalBorrowShares - shares : 0;
-        totalBorrowedPerToken[tokenId] = totalBorrowedPerToken[tokenId] > assets
-            ? totalBorrowedPerToken[tokenId] - assets : 0;
+        if (totalBorrowAssets == 0 && totalBorrowShares > 0) totalBorrowShares = 0;
+        if (totalBorrowShares == 0 && totalBorrowAssets > 0) totalBorrowAssets = 0;
+        totalBorrowedPerToken[tokenId] = totalBorrowedPerToken[tokenId] > principalReduction
+            ? totalBorrowedPerToken[tokenId] - principalReduction : 0;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -471,7 +479,7 @@ contract PredmartLendingPool is
     ) external nonReentrant {
         if (msg.sender != relayer) revert NotRelayer();
         if (block.timestamp > intent.deadline) revert IntentExpired();
-        if (intent.nonce != borrowNonces[intent.borrower]) revert InvalidNonce();
+        if (intent.nonce != withdrawNonces[intent.borrower]) revert InvalidNonce();
 
         // Verify borrower's EIP-712 signature
         bytes32 structHash = keccak256(abi.encode(
@@ -482,7 +490,7 @@ contract PredmartLendingPool is
         if (signer != intent.borrower) revert InvalidIntentSignature();
 
         // Consume nonce
-        borrowNonces[intent.borrower]++;
+        withdrawNonces[intent.borrower]++;
 
         _withdrawCollateral(intent.borrower, intent.to, intent.tokenId, intent.amount, priceData);
     }
@@ -580,6 +588,7 @@ contract PredmartLendingPool is
 
         // Update state
         pos.borrowShares += shares;
+        pos.borrowedPrincipal += intent.amount;
         totalBorrowAssets += intent.amount;
         totalBorrowShares += shares;
         totalBorrowedPerToken[intent.tokenId] += intent.amount;
@@ -613,12 +622,15 @@ contract PredmartLendingPool is
             sharesToBurn = _toBorrowShares(repayAmount, Math.Rounding.Floor);
         }
 
-        // Transfer USDC from borrower
+        uint256 pr = pos.borrowedPrincipal == 0 ? repayAmount
+            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
+            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
+        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
+
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), repayAmount);
 
-        // Update state
         pos.borrowShares -= sharesToBurn;
-        _reduceBorrowTracking(tokenId, repayAmount, sharesToBurn);
+        _reduceBorrowTracking(tokenId, repayAmount, sharesToBurn, pr);
 
         emit Repaid(msg.sender, tokenId, repayAmount);
     }
@@ -675,18 +687,23 @@ contract PredmartLendingPool is
             sharesToBurn = _toBorrowShares(vars.repayAmount, Math.Rounding.Floor);
         }
 
-        // Transfer USDC from liquidator
+        uint256 pr = pos.borrowedPrincipal == 0 ? vars.repayAmount
+            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
+            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
+        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
+
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), vars.liquidatorCost);
 
-        // Update position and global tracking
         pos.borrowShares -= sharesToBurn;
         pos.collateralAmount -= vars.seizeCollateral;
-        _reduceBorrowTracking(tokenId, vars.repayAmount, sharesToBurn);
+        _reduceBorrowTracking(tokenId, vars.repayAmount, sharesToBurn, pr);
 
-        // Handle residual bad debt: collateral gone but debt remains (edge case from rounding or bonus cap)
+        // Residual bad debt: collateral gone but debt remains
         if (pos.collateralAmount == 0 && pos.borrowShares > 0) {
             uint256 residualDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-            _reduceBorrowTracking(tokenId, residualDebt, pos.borrowShares);
+            uint256 rp = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : residualDebt;
+            pos.borrowedPrincipal = 0;
+            _reduceBorrowTracking(tokenId, residualDebt, pos.borrowShares, rp);
             vars.badDebt += residualDebt;
             pos.borrowShares = 0;
         }
@@ -735,7 +752,6 @@ contract PredmartLendingPool is
         if (pos.collateralAmount == 0) revert NoPosition();
 
         if (resolution.won) {
-            // Winning shares worth $1.00 — position stays open for borrower to repay
             emit PositionClosed(borrower, tokenId, 0);
         } else {
             // Losing shares worth $0 — write off bad debt
@@ -743,7 +759,8 @@ contract PredmartLendingPool is
                 ? _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil)
                 : 0;
             if (pos.borrowShares > 0) {
-                _reduceBorrowTracking(tokenId, badDebt, pos.borrowShares);
+                _reduceBorrowTracking(tokenId, badDebt, pos.borrowShares,
+                    pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : badDebt);
             }
             delete positions[borrower][tokenId];
             if (badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, badDebt);
@@ -810,7 +827,8 @@ contract PredmartLendingPool is
 
         // Clear borrow tracking
         if (pos.borrowShares > 0) {
-            _reduceBorrowTracking(tokenId, debt, pos.borrowShares);
+            _reduceBorrowTracking(tokenId, debt, pos.borrowShares,
+                pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : debt);
         }
 
         // Reduce unsettled redemptions by actual proceeds used
@@ -818,6 +836,7 @@ contract PredmartLendingPool is
 
         // Calculate surplus for borrower (proceeds - debt)
         uint256 surplus = proceeds > debt ? proceeds - debt : 0;
+        if (debt > proceeds) emit BadDebtAbsorbed(borrower, tokenId, debt - proceeds);
         delete positions[borrower][tokenId];
 
         // Send surplus to borrower
@@ -885,152 +904,53 @@ contract PredmartLendingPool is
         return PredmartPoolLib.calcHealthFactor(collateralAmount, debt, price, getLiquidationThreshold(price));
     }
 
-    /*//////////////////////////////////////////////////////////////
-                          ADMIN — INSTANT (safe operations)
+    /*////////////////////////////////////////////////////////////// 
+                    ADMIN (kept in main)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Transfer admin role
-    function transferAdmin(address newAdmin) external onlyAdmin {
-        if (newAdmin == address(0)) revert InvalidAddress();
-        admin = newAdmin;
-    }
-
-    /// @notice Freeze or unfreeze a specific token (blocks new deposits and borrows for that token)
-    function setTokenFrozen(uint256 tokenId, bool frozen) external onlyAdmin {
-        frozenTokens[tokenId] = frozen;
-        emit TokenFrozenEvent(tokenId, frozen);
-    }
-
-    /// @notice Pause or unpause the protocol (blocks new borrows and collateral deposits)
-    function setPaused(bool _paused) external onlyAdmin {
-        paused = _paused;
-        emit PausedStateChanged(_paused);
+    /// @notice Set the extension contract address (admin functions delegate to it).
+    ///         Only callable when extension is not yet set (bootstrap) or during upgradeToAndCall callback.
+    function setExtension(address ext) external onlyAdmin {
+        if (ext == address(0)) revert InvalidAddress();
+        if (extension != address(0) && timelockDelay > 0) revert TimelockNotReady();
+        extension = ext;
+        emit ExtensionUpdated(ext);
     }
 
     /// @notice Withdraw accumulated protocol reserves
     function withdrawReserves(uint256 amount) external onlyAdmin {
+        _accrueInterest();
         if (amount > totalReserves) amount = totalReserves;
         totalReserves -= amount;
         IERC20(asset()).safeTransfer(admin, amount);
         emit ReservesWithdrawn(admin, amount);
     }
 
-    /// @notice Rescue stolen collateral — supports single or batch. Skips empty positions.
-    function adminRescueCollateral(address[] calldata attackers, address[] calldata tos, uint256[] calldata tokenIds) external onlyAdmin {
-        for (uint256 i = 0; i < tokenIds.length; i++) {
-            uint256 amount = positions[attackers[i]][tokenIds[i]].collateralAmount;
-            if (amount == 0) continue;
-            positions[attackers[i]][tokenIds[i]].collateralAmount = 0;
-            ICTF(ctf).safeTransferFrom(address(this), tos[i], tokenIds[i], amount, "");
-            emit CollateralRescued(attackers[i], tos[i], tokenIds[i], amount);
-        }
-    }
-
-    /// @notice Set per-token borrow cap as basis points of totalAssets. 500 = 5%. 0 = disabled.
-    function setPoolCapBps(uint256 newCapBps) external onlyAdmin {
-        poolCapBps = newCapBps;
-        emit PoolCapUpdated(newCapBps);
-    }
-
-    /// @notice Get the current per-token borrow cap in USDC (6 decimals). Returns 0 if cap disabled.
+    /// @notice Get the current per-token borrow cap in USDC (6 decimals).
     function getTokenBorrowCap() external view returns (uint256) {
         if (poolCapBps == 0) return 0;
         return totalAssets().mulDiv(poolCapBps, 10000);
     }
 
-    /// @notice Activate or increase the timelock delay (one-way ratchet — can never decrease)
-    function activateTimelock(uint256 delay) external onlyAdmin {
-        if (delay < timelockDelay) revert TimelockCannotDecrease();
-        timelockDelay = delay;
-        emit TimelockActivated(delay);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                    ADMIN — TIMELOCKED (dangerous operations)
+    /*////////////////////////////////////////////////////////////// 
+                          EXTENSION FALLBACK
     //////////////////////////////////////////////////////////////*/
 
-    // ─── Oracle ───
-
-    /// @notice Propose a new oracle address. Takes effect after timelock delay.
-    function proposeOracle(address newOracle) external onlyAdmin {
-        if (newOracle == address(0)) revert InvalidAddress();
-        pendingOracle = newOracle;
-        pendingOracleExecAfter = block.timestamp + timelockDelay;
-        emit OracleChangeProposed(newOracle, pendingOracleExecAfter);
-    }
-
-    /// @notice Execute a pending oracle change after timelock has elapsed.
-    function executeOracle() external onlyAdmin {
-        if (pendingOracle == address(0)) revert NoPendingChange();
-        if (block.timestamp < pendingOracleExecAfter) revert TimelockNotReady();
-        emit OracleUpdated(oracle, pendingOracle);
-        oracle = pendingOracle;
-        delete pendingOracle;
-        delete pendingOracleExecAfter;
-    }
-
-    /// @notice Cancel a pending oracle change.
-    function cancelOracle() external onlyAdmin {
-        delete pendingOracle;
-        delete pendingOracleExecAfter;
-        emit OracleChangeCancelled();
-    }
-
-    // ─── Anchors ───
-
-    /// @notice Propose new risk model anchor points. Takes effect after timelock delay.
-    function proposeAnchors(
-        uint256[NUM_ANCHORS] calldata prices,
-        uint256[NUM_ANCHORS] calldata ltvs
-    ) external onlyAdmin {
-        // Validate prices are ascending and LTVs are non-decreasing with safe upper bound
-        for (uint256 i = 0; i < NUM_ANCHORS; i++) {
-            if (ltvs[i] + PredmartPoolLib.LIQUIDATION_BUFFER > 1e18) revert InvalidAnchors();
-            if (i > 0) {
-                if (prices[i] <= prices[i - 1]) revert InvalidAnchors();
-                if (ltvs[i] < ltvs[i - 1]) revert InvalidAnchors();
-            }
+    /// @dev Delegate unknown function calls to the extension contract.
+    fallback() external {
+        address ext = extension;
+        if (ext == address(0)) revert InvalidAddress();
+        assembly {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
         }
-        pendingPriceAnchors = prices;
-        pendingLtvAnchors = ltvs;
-        pendingAnchorsExecAfter = block.timestamp + timelockDelay;
-        emit AnchorsChangeProposed(pendingAnchorsExecAfter);
     }
 
-    /// @notice Execute a pending anchors change after timelock has elapsed.
-    function executeAnchors() external onlyAdmin {
-        if (pendingAnchorsExecAfter == 0) revert NoPendingChange();
-        if (block.timestamp < pendingAnchorsExecAfter) revert TimelockNotReady();
-        priceAnchors = pendingPriceAnchors;
-        ltvAnchors = pendingLtvAnchors;
-        delete pendingAnchorsExecAfter;
-        emit AnchorsUpdated();
-    }
-
-    /// @notice Cancel a pending anchors change.
-    function cancelAnchors() external onlyAdmin {
-        delete pendingAnchorsExecAfter;
-        emit AnchorsChangeCancelled();
-    }
-
-    // ─── Upgrade ───
-
-    /// @notice Propose a contract upgrade. Takes effect after timelock delay.
-    function proposeUpgrade(address newImplementation) external onlyAdmin {
-        if (newImplementation == address(0)) revert InvalidAddress();
-        pendingUpgrade = newImplementation;
-        pendingUpgradeExecAfter = block.timestamp + timelockDelay;
-        emit UpgradeProposed(newImplementation, pendingUpgradeExecAfter);
-    }
-
-    /// @notice Cancel a pending upgrade.
-    function cancelUpgrade() external onlyAdmin {
-        delete pendingUpgrade;
-        delete pendingUpgradeExecAfter;
-        emit UpgradeCancelled();
-    }
-
-    /*//////////////////////////////////////////////////////////////
+    /*////////////////////////////////////////////////////////////// 
                               UPGRADES
     //////////////////////////////////////////////////////////////*/
 

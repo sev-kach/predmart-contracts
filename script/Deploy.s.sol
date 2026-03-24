@@ -13,6 +13,7 @@ pragma solidity ^0.8.24;
 import { Script, console } from "forge-std/Script.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
+import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
 import { MockUSDC } from "../test/mocks/MockUSDC.sol";
 import { MockCTF } from "../test/mocks/MockCTF.sol";
 
@@ -87,8 +88,6 @@ contract Deploy is Script {
         // 3. Verify admin
         PredmartLendingPool pool = PredmartLendingPool(address(proxy));
         console.log("Admin:", pool.admin());
-        console.log("Name:", pool.NAME());
-        console.log("Version:", pool.VERSION());
 
         vm.stopBroadcast();
 
@@ -139,28 +138,63 @@ contract Deploy is Script {
                         UPGRADE LENDING POOL
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Generic upgrade (for future upgrades, no reinitialization)
-    /// @dev forge script script/Deploy.s.sol --sig "upgradePool()" --rpc-url polygon_mainnet --broadcast --verify
-    function upgradePool() external {
+    /// @notice Step 1: Deploy new impl + extension + propose upgrade (starts timelock)
+    /// @dev forge script script/Deploy.s.sol --sig "proposeUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
+    function proposeUpgrade() external {
         uint256 adminPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
-        address adminAddr = vm.addr(adminPrivateKey);
         Config memory cfg = _getConfig();
 
         require(cfg.lendingPoolProxy != address(0), "No lending pool proxy configured");
 
-        console.log("=== UPGRADE LENDING POOL ===");
+        PredmartPoolExtension ext = PredmartPoolExtension(cfg.lendingPoolProxy);
+
+        console.log("=== PROPOSE UPGRADE ===");
         console.log("Network:", _getNetworkName());
         console.log("Proxy:", cfg.lendingPoolProxy);
 
+        vm.startBroadcast(adminPrivateKey);
+
+        // Deploy new extension + implementation
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        PredmartLendingPool newImpl = new PredmartLendingPool();
+        console.log("New extension:", address(newExt));
+        console.log("New implementation:", address(newImpl));
+
+        // Propose upgrade via extension (proposeAddress kind=2=upgrade)
+        ext.proposeAddress(2, address(newImpl));
+
+        vm.stopBroadcast();
+
+        console.log("=== UPGRADE PROPOSED ===");
+        console.log("Save extension address for executeUpgrade: ", address(newExt));
+    }
+
+    /// @notice Step 2: Execute upgrade + set extension after timelock has elapsed
+    /// @dev EXTENSION_ADDRESS=0x... forge script script/Deploy.s.sol --sig "executeUpgrade()" --rpc-url polygon_mainnet --broadcast
+    function executeUpgrade() external {
+        uint256 adminPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        Config memory cfg = _getConfig();
+
+        require(cfg.lendingPoolProxy != address(0), "No lending pool proxy configured");
+
         PredmartLendingPool proxy = PredmartLendingPool(cfg.lendingPoolProxy);
-        require(proxy.admin() == adminAddr, "Not admin");
+
+        address pendingImpl = proxy.pendingUpgrade();
+        require(pendingImpl != address(0), "No pending upgrade");
+
+        address extensionAddr = vm.envAddress("EXTENSION_ADDRESS");
+        require(extensionAddr != address(0), "Set EXTENSION_ADDRESS env var");
+
+        console.log("=== EXECUTE UPGRADE ===");
+        console.log("Pending implementation:", pendingImpl);
+        console.log("Extension:", extensionAddr);
 
         vm.startBroadcast(adminPrivateKey);
 
-        PredmartLendingPool newImpl = new PredmartLendingPool();
-        console.log("New implementation:", address(newImpl));
-
-        proxy.upgradeToAndCall(address(newImpl), "");
+        // upgradeToAndCall with setExtension in the callback — sets extension atomically during upgrade
+        bytes memory initData = abi.encodeWithSelector(PredmartLendingPool.setExtension.selector, extensionAddr);
+        proxy.upgradeToAndCall(pendingImpl, initData);
+        console.log("Upgrade executed + extension set");
 
         vm.stopBroadcast();
 
@@ -195,7 +229,7 @@ contract Deploy is Script {
         proxy.upgradeToAndCall(address(newImpl), initData);
 
         // Verify
-        console.log("Version:", proxy.VERSION());
+        console.log("Upgrade applied");
         console.log("Relayer:", proxy.relayer());
 
         vm.stopBroadcast();

@@ -35,6 +35,8 @@
 
 set -e
 
+export PATH="$PATH:$HOME/.foundry/bin"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")/project"
 CACHE_DIR="$SCRIPT_DIR/deploy_cache"

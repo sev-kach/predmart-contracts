@@ -153,4 +153,5 @@ library PredmartPoolLib {
         uint256 collateralValue = collateralAmount.mulDiv(price, 1e18);
         return collateralValue.mulDiv(threshold, debt);
     }
+
 }

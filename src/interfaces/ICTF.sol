@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-PredMart-NC
+// SPDX-License-Identifier: MIT
 // contracts/src/interfaces/ICTF.sol
 pragma solidity ^0.8.24;
 

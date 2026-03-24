@@ -6,12 +6,14 @@ import { Test, console } from "forge-std/Test.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
+import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
 import { PredmartOracle } from "../src/PredmartOracle.sol";
 import { MockUSDC } from "./mocks/MockUSDC.sol";
 import { MockCTF } from "./mocks/MockCTF.sol";
 
 contract PredmartLendingPoolTest is Test {
     PredmartLendingPool public pool;
+    PredmartPoolExtension public poolAdmin; // Same address as pool, cast for admin function calls via fallback
     MockUSDC public usdc;
     MockCTF public ctf;
 
@@ -83,6 +85,12 @@ contract PredmartLendingPoolTest is Test {
         );
 
         pool = PredmartLendingPool(address(proxy));
+        poolAdmin = PredmartPoolExtension(address(proxy));
+
+        // Deploy and set extension contract for admin functions
+        PredmartPoolExtension ext = new PredmartPoolExtension();
+        vm.prank(admin);
+        pool.setExtension(address(ext));
 
         // Seed accounts
         usdc.mint(lender, 100_000e6);
@@ -228,7 +236,7 @@ contract PredmartLendingPoolTest is Test {
         assertEq(pool.oracle(), oracleAddress);
         assertEq(pool.asset(), address(usdc));
         assertEq(pool.relayer(), relayer);
-        assertEq(keccak256(bytes(pool.VERSION())), keccak256(bytes("0.8.0")));
+        // VERSION is internal — no public getter (size optimization)
         assertEq(keccak256(bytes(pool.name())), keccak256(bytes("Predmart USDC")));
         assertEq(keccak256(bytes(pool.symbol())), keccak256(bytes("pUSDC")));
         assertEq(pool.decimals(), 12); // USDC 6 + _decimalsOffset 6
@@ -266,7 +274,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_WithdrawLimitedByLiquidity() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about liquidity limits, not cap
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about liquidity limits, not cap
         _supply(lender, 10_000e6);
 
         // Borrower takes 5000 USDC (within LTV: 10000 * 0.80 * 0.70 = 5600 max)
@@ -289,7 +297,7 @@ contract PredmartLendingPoolTest is Test {
         pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
         vm.stopPrank();
 
-        (uint256 collateral,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
         assertEq(ctf.balanceOf(address(pool), TOKEN_ID_YES), 5_000e6);
     }
@@ -319,7 +327,7 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         pool.withdrawViaRelay(intent, sig, dummyPrice);
 
-        (uint256 collateral,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 3_000e6);
     }
 
@@ -328,7 +336,7 @@ contract PredmartLendingPoolTest is Test {
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
         // Try to withdraw too much collateral via relay
-        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 nonce = pool.withdrawNonces(borrower);
         uint256 deadline = block.timestamp + 300;
         PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool.WithdrawIntent({
             borrower: borrower,
@@ -353,7 +361,7 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
-        (uint256 collateral, uint256 borrowShares,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
         assertGt(borrowShares, 0);
         assertEq(pool.totalBorrowAssets(), 2_000e6);
@@ -388,7 +396,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_Borrow_RevertsInsufficientLiquidity() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about liquidity limits
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about liquidity limits
         _supply(lender, 1_000e6);
 
         vm.startPrank(borrower);
@@ -422,7 +430,7 @@ contract PredmartLendingPoolTest is Test {
         pool.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
-        (,uint256 debt,) = pool.positions(borrower, TOKEN_ID_YES);
+        (,uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(debt, 0);
         assertEq(pool.totalBorrowAssets(), 0);
     }
@@ -436,7 +444,7 @@ contract PredmartLendingPoolTest is Test {
         pool.repay(TOKEN_ID_YES, 500e6);
         vm.stopPrank();
 
-        (,uint256 borrowShares,) = pool.positions(borrower, TOKEN_ID_YES);
+        (,uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertGt(borrowShares, 0);
         assertEq(pool.totalBorrowAssets(), 1_500e6);
     }
@@ -483,7 +491,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_Liquidation() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about liquidation mechanics
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about liquidation mechanics
         _supply(lender, 50_000e6);
         // Borrow at $0.80 price
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
@@ -497,7 +505,7 @@ contract PredmartLendingPoolTest is Test {
         pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, lowPrice);
 
         // Position should be deleted
-        (uint256 collateral, uint256 debt,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(debt, 0);
 
@@ -549,7 +557,7 @@ contract PredmartLendingPoolTest is Test {
         pool.closeResolvedPosition(borrower, TOKEN_ID_YES);
 
         // Position should still exist (borrower needs to repay)
-        (uint256 collateral,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
     }
 
@@ -564,7 +572,7 @@ contract PredmartLendingPoolTest is Test {
         pool.closeResolvedPosition(borrower, TOKEN_ID_YES);
 
         // Position should be deleted (bad debt written off)
-        (uint256 collateral, uint256 debt,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(debt, 0);
         assertEq(pool.totalBorrowAssets(), 0);
@@ -626,7 +634,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_BorrowRate_AtKink() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about interest rate model
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about interest rate model
         _supply(lender, 10_000e6);
         // Borrow within LTV: 5000 collateral at $1.00, LTV=75%, max=3750. Borrow 3500.
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 3_500e6, 1e18);
@@ -741,21 +749,21 @@ contract PredmartLendingPoolTest is Test {
     function test_TransferAdmin() public {
         address newAdmin = makeAddr("newAdmin");
         vm.prank(admin);
-        pool.transferAdmin(newAdmin);
+        poolAdmin.transferAdmin(newAdmin);
         assertEq(pool.admin(), newAdmin);
     }
 
     function test_TransferAdmin_RevertsNonAdmin() public {
         vm.prank(lender);
         vm.expectRevert(PredmartLendingPool.NotAdmin.selector);
-        pool.transferAdmin(lender);
+        poolAdmin.transferAdmin(lender);
     }
 
     function test_SetOracle() public {
         address newOracle = makeAddr("newOracle");
         vm.startPrank(admin);
-        pool.proposeOracle(newOracle);
-        pool.executeOracle();
+        poolAdmin.proposeAddress(0, newOracle);
+        poolAdmin.executeAddress(0);
         vm.stopPrank();
         assertEq(pool.oracle(), newOracle);
     }
@@ -792,7 +800,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Admin pauses
         vm.prank(admin);
-        pool.setPaused(true);
+        poolAdmin.setPaused(true);
         assertTrue(pool.paused());
 
         // Borrow via relay should revert
@@ -814,7 +822,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_Pause_BlocksDepositCollateral() public {
         vm.prank(admin);
-        pool.setPaused(true);
+        poolAdmin.setPaused(true);
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
@@ -829,7 +837,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Admin pauses
         vm.prank(admin);
-        pool.setPaused(true);
+        poolAdmin.setPaused(true);
 
         // Repay still works
         vm.startPrank(borrower);
@@ -846,34 +854,34 @@ contract PredmartLendingPoolTest is Test {
 
     function test_Pause_AllowsLiquidation() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about pause behavior
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about pause behavior
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
 
         vm.prank(admin);
-        pool.setPaused(true);
+        poolAdmin.setPaused(true);
 
         // Liquidation still works (via relayer)
         vm.prank(relayer);
         pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
 
-        (uint256 collateral,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
     }
 
     function test_Unpause() public {
         vm.prank(admin);
-        pool.setPaused(true);
+        poolAdmin.setPaused(true);
 
         vm.prank(admin);
-        pool.setPaused(false);
+        poolAdmin.setPaused(false);
         assertFalse(pool.paused());
 
         // Borrow works again
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
-        (, uint256 borrowShares,) = pool.positions(borrower, TOKEN_ID_YES);
+        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertGt(borrowShares, 0);
     }
 
@@ -882,8 +890,8 @@ contract PredmartLendingPoolTest is Test {
         uint256[7] memory ltvs = [uint256(0.01e18), 0.05e18, 0.25e18, 0.40e18, 0.55e18, 0.65e18, 0.70e18];
 
         vm.startPrank(admin);
-        pool.proposeAnchors(prices, ltvs);
-        pool.executeAnchors();
+        poolAdmin.proposeAnchors(prices, ltvs);
+        poolAdmin.executeAnchors();
         vm.stopPrank();
 
         assertEq(pool.priceAnchors(1), 0.15e18);
@@ -904,8 +912,8 @@ contract PredmartLendingPoolTest is Test {
         _depositAndBorrow(borrower, TOKEN_ID_NO, 2_000e6, 800e6, 0.80e18);
 
         // Both positions should exist independently
-        (uint256 collYes, uint256 sharesYes,) = pool.positions(borrower, TOKEN_ID_YES);
-        (uint256 collNo, uint256 sharesNo,) = pool.positions(borrower, TOKEN_ID_NO);
+        (uint256 collYes, uint256 sharesYes,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collNo, uint256 sharesNo,,) = pool.positions(borrower, TOKEN_ID_NO);
         assertEq(collYes, 3_000e6);
         assertGt(sharesYes, 0);
         assertEq(collNo, 2_000e6);
@@ -919,7 +927,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_IsolatedPositions_OneLiquidatedOtherSafe() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about position isolation
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about position isolation
         _supply(lender, 50_000e6);
 
         // Two positions for the same borrower
@@ -932,11 +940,11 @@ contract PredmartLendingPoolTest is Test {
         pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
 
         // YES position liquidated
-        (uint256 collYes,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collYes,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collYes, 0);
 
         // NO position untouched
-        (uint256 collNo, uint256 sharesNo,) = pool.positions(borrower, TOKEN_ID_NO);
+        (uint256 collNo, uint256 sharesNo,,) = pool.positions(borrower, TOKEN_ID_NO);
         assertEq(collNo, 5_000e6);
         assertGt(sharesNo, 0);
     }
@@ -995,13 +1003,13 @@ contract PredmartLendingPoolTest is Test {
     function test_BorrowCap_InitializedTo5Percent() public view {
         assertEq(pool.poolCapBps(), 500);
         // Pool has 0 deposits, so cap is 0
-        assertEq(pool.getTokenBorrowCap(), 0);
+        assertEq(pool.totalAssets() * pool.poolCapBps() / 10000, 0);
     }
 
     function test_BorrowCap_ScalesWithDeposits() public {
         _supply(lender, 50_000e6);
         // 5% of 50,000 = 2,500
-        assertEq(pool.getTokenBorrowCap(), 2_500e6);
+        assertEq(pool.totalAssets() * pool.poolCapBps() / 10000, 2_500e6);
     }
 
     function test_BorrowCap_BlocksExcessiveBorrow() public {
@@ -1067,19 +1075,19 @@ contract PredmartLendingPoolTest is Test {
 
     function test_BorrowCap_AdminCanUpdate() public {
         vm.prank(admin);
-        pool.setPoolCapBps(1000); // 10%
+        poolAdmin.setPoolCapBps(1000); // 10%
         assertEq(pool.poolCapBps(), 1000);
 
         _supply(lender, 50_000e6);
-        assertEq(pool.getTokenBorrowCap(), 5_000e6); // 10% of 50K
+        assertEq(pool.totalAssets() * pool.poolCapBps() / 10000, 5_000e6); // 10% of 50K
     }
 
     function test_BorrowCap_DisabledWhenZero() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0);
+        poolAdmin.setPoolCapBps(0);
 
         _supply(lender, 50_000e6);
-        assertEq(pool.getTokenBorrowCap(), 0);
+        assertEq(pool.totalAssets() * pool.poolCapBps() / 10000, 0);
 
         // Should still be able to borrow (cap disabled)
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
@@ -1090,7 +1098,7 @@ contract PredmartLendingPoolTest is Test {
 
     function test_ViewFunctions_IncludePendingInterest() public {
         vm.prank(admin);
-        pool.setPoolCapBps(0); // Disable cap — this test is about view function accrual
+        poolAdmin.setPoolCapBps(0); // Disable cap — this test is about view function accrual
         _supply(lender, 10_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
