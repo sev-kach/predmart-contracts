@@ -34,23 +34,43 @@ The proxy contract is verified on Polygonscan. You can read the full source code
 
 ### Contract Design
 
-The core contract is `PredmartLendingPool` — a single upgradeable contract (UUPS proxy pattern via ERC-1967) that handles all protocol operations:
+The protocol is split across two contracts that share a single proxy address:
+
+**`PredmartLendingPool`** — the main contract (UUPS proxy, ERC-1967) handling core lending operations:
 
 - **ERC-4626 Vault** — manages lender USDC deposits, mints/burns pUSDC shares, and distributes yield
 - **Collateral Manager** — tracks per-user, per-token ERC-1155 collateral deposits and loan positions
+- **Meta-Transaction Relayer** — all borrow, withdraw, and leverage operations use EIP-712 signed intents submitted by a trusted relayer, eliminating the need for users to hold gas tokens
+- **Leverage Engine** — `leverageStep()` enables iterative deposit-and-borrow loops: users sign a single `LeverageAuth` message authorizing a maximum borrow budget, and the relayer executes multiple steps within that budget. Borrowed USDC goes to the user's Safe (`auth.allowedFrom`), not the relayer
 - **Interest Rate Model** — kinked utilization-based curve: low rates at low utilization, sharply rising rates above the kink to incentivize liquidity
 - **Dynamic LTV Curve** — 7-anchor price interpolation that adjusts the loan-to-value ratio based on current collateral price; shares closer to $1.00 receive higher LTV
-- **Oracle Verifier** — validates cryptographically signed, timestamp-bounded price data from the PredMart relayer; rejects data older than 10 seconds
-- **Liquidation Engine** — allows authorized liquidators to repay unhealthy positions and seize collateral
-- **Timelock Governance** — sensitive parameter changes require a mandatory waiting period before taking effect
+- **Oracle Verifier** — validates cryptographically signed, timestamp-bounded price data; rejects data older than 10 seconds
+- **Liquidation Engine** — allows the relayer to repay unhealthy positions and seize collateral
+- **Timelock Governance** — sensitive parameter changes (oracle, relayer, risk model, upgrades) require a mandatory waiting period before taking effect; the delay is a one-way ratchet (can only increase)
+
+**`PredmartPoolExtension`** — admin governance and market resolution, called via `delegatecall` from the main contract's `fallback()`:
+
+- **Timelocked Admin Functions** — propose/execute changes to oracle, relayer, risk anchors, and contract upgrades
+- **Market Resolution** — permissionless functions to resolve Polymarket markets, close positions on resolved markets, redeem winning CTF shares for USDC, and settle borrower positions with pro-rata surplus distribution
+- **Inline Helpers** — duplicates of internal interest accrual and borrow tracking functions (required because the extension cannot call the main contract's `internal` functions via delegatecall)
+
+Both contracts share an identical storage layout to ensure safe delegatecall execution.
 
 ### Oracle Design
 
 PredMart does not use on-chain price oracles. Instead, the backend fetches real-time prices from Polymarket's Central Limit Order Book (CLOB), signs them with an authorized oracle key using EIP-712, and submits them alongside user transactions. The contract verifies the signature and timestamp on-chain before executing any price-sensitive operation.
 
+### Meta-Transaction Pattern
+
+Users never submit transactions directly. Instead, they sign EIP-712 typed data messages (intents) off-chain, and a trusted relayer submits the transaction on their behalf. This means users don't need POL for gas — the relayer pays. The contract verifies every signature on-chain before executing:
+
+- **BorrowIntent** — signed by the borrower, specifies amount, token, and destination
+- **WithdrawIntent** — signed by the borrower, specifies amount, token, and withdrawal destination
+- **LeverageAuth** — signed once per leverage operation, authorizes a cumulative borrow budget with an explicit `allowedFrom` address (user's Gnosis Safe) where USDC is sent
+
 ### Upgradeability
 
-The contract uses the **UUPS (Universal Upgradeable Proxy Standard)** pattern. The proxy address never changes — only the implementation can be upgraded by the admin. All upgrade transactions are recorded in the `broadcast/` directory with full on-chain verification.
+The contract uses the **UUPS (Universal Upgradeable Proxy Standard)** pattern. The proxy address never changes — only the implementation can be upgraded by the admin after a timelock delay. The extension contract is updated atomically during upgrades via a `reinitializer` callback in `upgradeToAndCall`. All upgrade transactions are recorded in the `broadcast/` directory with full on-chain verification.
 
 ---
 
@@ -59,7 +79,9 @@ The contract uses the **UUPS (Universal Upgradeable Proxy Standard)** pattern. T
 ```
 predmart-contracts/
 ├── src/
-│   ├── PredmartLendingPool.sol     # Core lending pool (ERC-4626 + collateral + liquidation)
+│   ├── PredmartLendingPool.sol     # Core lending pool (ERC-4626 + collateral + leverage + liquidation)
+│   ├── PredmartPoolExtension.sol   # Admin governance + market resolution (called via delegatecall)
+│   ├── PredmartPoolLib.sol         # Interest rate model + liquidation math
 │   ├── PredmartOracle.sol          # Oracle signature verification helpers
 │   └── interfaces/
 │       └── ICTF.sol                # Interface for Polymarket's CTF ERC-1155 contract
@@ -69,7 +91,7 @@ predmart-contracts/
 │       ├── MockUSDC.sol            # Mock ERC-20 USDC for testing
 │       └── MockCTF.sol             # Mock ERC-1155 CTF token for testing
 ├── script/
-│   └── Deploy.s.sol                # Deployment & upgrade scripts (Foundry)
+│   └── Deploy.s.sol                # Deployment & timelocked upgrade scripts (Foundry)
 ├── broadcast/                      # On-chain deployment records (tx hashes & addresses)
 │   ├── Deploy.s.sol/137/           # Polygon Mainnet deployment history
 │   └── Deploy.s.sol/80002/         # Polygon Amoy testnet deployment history
@@ -139,11 +161,19 @@ Deployments use the `deploy.sh` wrapper, which loads environment variables from 
 ./deploy.sh mainnet deployLendingPool   # Polygon Mainnet
 ```
 
-### Upgrade existing deployment
+### Upgrade existing deployment (timelocked)
+
+Upgrades are a two-step process with a mandatory timelock delay between proposal and execution:
 
 ```bash
-./deploy.sh mainnet upgradePool         # Generic upgrade (no reinitialization)
+# Step 1: Deploy new implementation + extension, propose upgrade (starts timelock)
+./deploy.sh mainnet proposeUpgrade
+
+# Step 2: Execute upgrade after timelock has elapsed
+EXTENSION_ADDRESS=0x... ./deploy.sh mainnet executeUpgrade
 ```
+
+The `proposeUpgrade` script deploys both a new `PredmartLendingPool` implementation and a new `PredmartPoolExtension`, then calls `proposeAddress(2, newImpl)` to start the timelock. After the delay, `executeUpgrade` calls `upgradeToAndCall` with a reinitializer that sets the new extension atomically.
 
 ### Retry Polygonscan verification (no redeployment, no gas cost)
 
@@ -163,9 +193,11 @@ Deployments use the `deploy.sh` wrapper, which loads environment variables from 
 | Borrow currency | USDC.e (Polygon) |
 | Vault share token | pUSDC (ERC-4626) |
 | Blockchain | Polygon (PoS) |
+| Transaction pattern | EIP-712 meta-transactions via trusted relayer |
 | Oracle price freshness window | 10 seconds |
 | LTV curve anchors | 7 price points |
-| Upgrade pattern | UUPS (ERC-1967) |
+| Per-token borrow cap | 5% of pool |
+| Upgrade pattern | UUPS (ERC-1967) with timelock |
 
 ---
 
@@ -184,13 +216,16 @@ Managed as git submodules via Foundry:
 
 ## Security
 
-- **Non-custodial:** All funds are held by the smart contract. PredMart (the team) cannot access or move user funds.
+- **Non-custodial:** All funds are held by the smart contract. PredMart (the team) cannot access or move user funds. Leverage operations send borrowed USDC to the user's own Gnosis Safe, not to the relayer or any admin wallet.
+- **EIP-712 signature verification:** Every relay operation (borrow, withdraw, leverage) requires a cryptographic signature from the user. The relayer cannot modify fund destinations — all recipient addresses are part of the signed message.
+- **Cumulative borrow budgets:** Leverage operations enforce a user-signed maximum borrow amount. The contract tracks cumulative borrowing per authorization, preventing the relayer from exceeding the user's intent across multiple steps.
 - **Oracle signature verification:** All price data is signed by an authorized oracle key and verified on-chain with a 10-second freshness requirement.
-- **Timelock governance:** Sensitive parameter changes (oracle address, risk parameters, fee rates) require a mandatory waiting period before taking effect.
+- **Timelock governance:** Sensitive parameter changes (oracle address, relayer address, risk parameters, contract upgrades) require a mandatory waiting period before taking effect. The timelock delay is a one-way ratchet — it can only be increased, never decreased.
 - **Dynamic LTV:** Loan-to-value ratios adjust automatically based on real-time collateral prices, reducing risk from sudden price drops.
 - **Depth-gated borrow caps:** Maximum borrowable amount per token is capped by that token's orderbook liquidity on Polymarket, preventing concentration in illiquid markets.
-- **Emergency pause:** Admin can pause the protocol instantly in case of a critical vulnerability.
+- **Emergency pause:** Admin can pause the protocol instantly. Pausing blocks new borrows, deposits, and leverage — but repayments, withdrawals, and liquidations remain open so users can exit.
 - **Price drop guard:** New borrows are automatically blocked during rapid collateral price crashes.
+- **Replay protection:** Separate nonce sequences for borrow, withdraw, and leverage operations prevent cross-operation replay attacks.
 
 For a full security breakdown, see the [Security documentation](https://predmart.com/docs/security).
 
