@@ -49,6 +49,12 @@ contract PredmartLendingPool is
     bytes32 public constant WITHDRAW_INTENT_TYPEHASH = keccak256(
         "WithdrawIntent(address borrower,address to,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
     );
+    bytes32 public constant LEVERAGE_AUTH_TYPEHASH = keccak256(
+        "LeverageAuth(address borrower,address allowedFrom,uint256 tokenId,uint256 maxBorrow,uint256 nonce,uint256 deadline)"
+    );
+    bytes32 public constant DELEVERAGE_AUTH_TYPEHASH = keccak256(
+        "DeleverageAuth(address borrower,address allowedTo,uint256 tokenId,uint256 maxWithdraw,uint256 nonce,uint256 deadline)"
+    );
 
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
@@ -78,6 +84,8 @@ contract PredmartLendingPool is
     error InvalidIntentSignature();
     error InvalidNonce();
     error NotProxyOwner();
+    error ExceedsBorrowBudget();
+    error ExceedsWithdrawBudget();
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
@@ -151,6 +159,26 @@ contract PredmartLendingPool is
         uint256 deadline;
     }
 
+    /// @notice EIP-712 authorization for a leverage loop (signed once, reusable within budget)
+    struct LeverageAuth {
+        address borrower;
+        address allowedFrom; // Permitted source for CTF shares (user's Safe for first loop, relayer always allowed via msg.sender)
+        uint256 tokenId;
+        uint256 maxBorrow; // Max cumulative USDC the relayer can borrow under this auth (6 decimals)
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    /// @notice EIP-712 authorization for a deleverage loop (signed once, reusable within budget)
+    struct DeleverageAuth {
+        address borrower;
+        address allowedTo; // Destination for withdrawn collateral (user's Safe)
+        uint256 tokenId;
+        uint256 maxWithdraw; // Max cumulative shares the relayer can withdraw under this auth
+        uint256 nonce;
+        uint256 deadline;
+    }
+
     /*//////////////////////////////////////////////////////////////
                             STATE — SLOT 0+
     //////////////////////////////////////////////////////////////*/
@@ -192,7 +220,8 @@ contract PredmartLendingPool is
     uint256 public unsettledRedemptions; // USDC received from CTF redemptions but not yet settled against positions
 
     // Timelock — ratchet (can only increase, never decrease)
-    uint256 public timelockDelay; // 0 = no timelock (dev mode), set to 24h+ for production
+    // PRODUCTION: 6h timelock active on-chain (21600s). Persists across UUPS upgrades.
+    uint256 public timelockDelay;
 
     // Pending timelocked changes
     address public pendingOracle;
@@ -220,6 +249,14 @@ contract PredmartLendingPool is
     address public extension; // v0.9.1 — extension contract for admin functions (delegatecall target)
     address public pendingAdmin; // v0.9.1 — timelocked admin transfer
     uint256 public pendingAdminExecAfter;
+
+    // v1.0.0 — Leverage loop authorization
+    mapping(address => uint256) public leverageNonces; // Separate nonce for leverage (doesn't interfere with borrow/withdraw nonces)
+    mapping(bytes32 => uint256) public leverageBorrowUsed; // authHash => cumulative USDC borrowed under this auth
+
+    // v1.1.0 — Deleverage loop authorization
+    mapping(address => uint256) public deleverageNonces; // Separate nonce for deleverage
+    mapping(bytes32 => uint256) public deleverageWithdrawUsed; // authHash => cumulative shares withdrawn under this auth
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -285,6 +322,12 @@ contract PredmartLendingPool is
     function initializeV4(address _relayer) public reinitializer(4) {
         __EIP712_init("Predmart Lending Pool", "0.8.0");
         relayer = _relayer;
+    }
+
+    /// @notice Initialize v1.0.0 — set extension address during UUPS upgrade
+    /// @param _extension New extension contract address
+    function initializeV5(address _extension) public reinitializer(5) {
+        extension = _extension;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -437,7 +480,7 @@ contract PredmartLendingPool is
     /// @param tokenId Polymarket CTF token ID
     /// @param amount Number of shares to deposit
     function depositCollateral(uint256 tokenId, uint256 amount) external nonReentrant whenNotPaused {
-        _depositCollateral(msg.sender, tokenId, amount);
+        _depositCollateral(msg.sender, msg.sender, tokenId, amount);
     }
 
     /// @notice Deposit collateral from a different address (e.g. Polymarket Safe proxy).
@@ -453,18 +496,21 @@ contract PredmartLendingPool is
             );
             if (!ok || data.length < 32 || !abi.decode(data, (bool))) revert NotProxyOwner();
         }
-        _depositCollateral(from, tokenId, amount);
+        _depositCollateral(msg.sender, from, tokenId, amount);
     }
 
-    function _depositCollateral(address from, uint256 tokenId, uint256 amount) internal {
+    /// @dev Internal deposit: transfers CTF shares from `from` and credits the position to `creditTo`.
+    ///      `creditTo` == `from` for direct deposits; `creditTo` != `from` for relay-based deposits
+    ///      (e.g. leverage: relayer deposits from Safe, position credited to the EOA borrower).
+    function _depositCollateral(address creditTo, address from, uint256 tokenId, uint256 amount) internal {
         if (frozenTokens[tokenId]) revert TokenFrozen();
         if (resolvedMarkets[tokenId].resolved) revert MarketResolved();
 
         ICTF(ctf).safeTransferFrom(from, address(this), tokenId, amount, "");
 
-        positions[msg.sender][tokenId].collateralAmount += amount;
+        positions[creditTo][tokenId].collateralAmount += amount;
 
-        emit CollateralDeposited(msg.sender, tokenId, amount);
+        emit CollateralDeposited(creditTo, tokenId, amount);
     }
 
     /// @notice Withdraw collateral via meta-transaction relay. Only callable by the relayer.
@@ -550,15 +596,174 @@ contract PredmartLendingPool is
         // Consume nonce
         borrowNonces[intent.borrower]++;
 
-        // Standard borrow checks
-        if (frozenTokens[intent.tokenId]) revert TokenFrozen();
         if (priceData.tokenId != intent.tokenId) revert PredmartOracle.TokenIdMismatch();
-        if (resolvedMarkets[intent.tokenId].resolved) revert MarketResolved();
         uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
 
         _accrueInterest();
+        _executeBorrow(intent.borrower, intent.tokenId, intent.amount, price, priceData.maxBorrow, intent.borrower);
+    }
 
-        Position storage pos = positions[intent.borrower][intent.tokenId];
+    /// @notice Execute one step of a leverage loop: deposit collateral + borrow USDC to user's Safe.
+    /// @dev Only callable by the relayer. User must sign a LeverageAuth EIP-712 message authorizing
+    ///      a maximum borrow budget. The contract verifies the signature and tracks cumulative borrowing
+    ///      against the budget. The auth is consumed (nonce incremented) on first use and expires at deadline.
+    ///      Borrowed USDC goes to auth.allowedFrom (user's Safe) so the user can buy shares on the CLOB.
+    /// @param auth The user's leverage authorization (tokenId, maxBorrow budget, nonce, deadline)
+    /// @param authSignature The user's EIP-712 signature of the LeverageAuth
+    /// @param from Address holding CTF shares (user's Safe for first loop, relayer for subsequent loops)
+    /// @param depositAmount Number of CTF shares to deposit as collateral (0 to skip deposit)
+    /// @param borrowAmount USDC amount to borrow in this step (6 decimals, 0 to skip borrow)
+    /// @param priceData Signed oracle price data (required when borrowAmount > 0)
+    function leverageStep(
+        LeverageAuth calldata auth,
+        bytes calldata authSignature,
+        address from,
+        uint256 depositAmount,
+        uint256 borrowAmount,
+        PredmartOracle.PriceData calldata priceData
+    ) external nonReentrant whenNotPaused {
+        if (msg.sender != relayer) revert NotRelayer();
+        if (block.timestamp > auth.deadline) revert IntentExpired();
+
+        // Validate `from`: must be the user-signed allowedFrom OR the relayer itself
+        if (from != auth.allowedFrom && from != msg.sender) revert InvalidAddress();
+
+        // Verify user's EIP-712 signature (includes allowedFrom — prevents relayer stealing from arbitrary addresses)
+        bytes32 structHash = keccak256(abi.encode(
+            LEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedFrom, auth.tokenId,
+            auth.maxBorrow, auth.nonce, auth.deadline
+        ));
+        bytes32 authHash = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(authHash, authSignature);
+        if (signer != auth.borrower) revert InvalidIntentSignature();
+
+        _accrueInterest();
+
+        if (depositAmount > 0) {
+            _depositCollateral(auth.borrower, from, auth.tokenId, depositAmount);
+        }
+
+        if (borrowAmount > 0) {
+            // Consume nonce on first borrow (not on deposit-only calls)
+            if (leverageBorrowUsed[authHash] == 0) {
+                if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
+                leverageNonces[auth.borrower]++;
+            }
+
+            // Enforce cumulative borrow budget
+            uint256 newTotal = leverageBorrowUsed[authHash] + borrowAmount;
+            if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
+            leverageBorrowUsed[authHash] = newTotal;
+
+            if (priceData.tokenId != auth.tokenId) revert PredmartOracle.TokenIdMismatch();
+            uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
+            _executeBorrow(auth.borrower, auth.tokenId, borrowAmount, price, priceData.maxBorrow, auth.allowedFrom);
+        }
+    }
+
+    /// @notice Execute one step of a deleverage loop: repay debt from Safe + withdraw collateral to Safe.
+    /// @dev Only callable by the relayer. User must sign a DeleverageAuth EIP-712 message authorizing
+    ///      a maximum withdrawal budget. The contract verifies the signature and tracks cumulative withdrawals
+    ///      against the budget. Repay happens first (improves HF), then withdrawal (checked against HF).
+    /// @param auth The user's deleverage authorization (tokenId, maxWithdraw budget, nonce, deadline)
+    /// @param authSignature The user's EIP-712 signature of the DeleverageAuth
+    /// @param to Destination for withdrawn collateral (user's Safe)
+    /// @param repayAmount USDC to repay in this step (6 decimals, 0 to skip repay — e.g. first step)
+    /// @param withdrawAmount Number of CTF shares to withdraw as collateral (0 to skip — e.g. final repay)
+    /// @param priceData Signed oracle price data (required when withdrawAmount > 0 and position has remaining debt)
+    function deleverageStep(
+        DeleverageAuth calldata auth,
+        bytes calldata authSignature,
+        address to,
+        uint256 repayAmount,
+        uint256 withdrawAmount,
+        PredmartOracle.PriceData calldata priceData
+    ) external nonReentrant whenNotPaused {
+        if (msg.sender != relayer) revert NotRelayer();
+        if (block.timestamp > auth.deadline) revert IntentExpired();
+
+        // Validate `to`: must be the user-signed allowedTo OR the relayer itself
+        if (to != auth.allowedTo && to != msg.sender) revert InvalidAddress();
+
+        // Verify user's EIP-712 signature
+        bytes32 structHash = keccak256(abi.encode(
+            DELEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedTo, auth.tokenId,
+            auth.maxWithdraw, auth.nonce, auth.deadline
+        ));
+        bytes32 authHash = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(authHash, authSignature);
+        if (signer != auth.borrower) revert InvalidIntentSignature();
+
+        _accrueInterest();
+
+        // Repay first — reduces debt, improves HF for subsequent withdrawal
+        if (repayAmount > 0) {
+            _repayFrom(auth.borrower, auth.allowedTo, auth.tokenId, repayAmount);
+        }
+
+        if (withdrawAmount > 0) {
+            // Consume nonce on first withdrawal (not on repay-only calls)
+            if (deleverageWithdrawUsed[authHash] == 0) {
+                if (auth.nonce != deleverageNonces[auth.borrower]) revert InvalidNonce();
+                deleverageNonces[auth.borrower]++;
+            }
+
+            // Enforce cumulative withdraw budget
+            uint256 newTotal = deleverageWithdrawUsed[authHash] + withdrawAmount;
+            if (newTotal > auth.maxWithdraw) revert ExceedsWithdrawBudget();
+            deleverageWithdrawUsed[authHash] = newTotal;
+
+            _withdrawCollateral(auth.borrower, to, auth.tokenId, withdrawAmount, priceData);
+        }
+    }
+
+    /// @dev Internal repay from a specified address (e.g. Safe during deleverage).
+    ///      Mirrors repay() but pulls USDC from `from` instead of msg.sender.
+    ///      Caller must call _accrueInterest() before this function.
+    function _repayFrom(address borrower, address from, uint256 tokenId, uint256 amount) internal {
+        Position storage pos = positions[borrower][tokenId];
+        if (pos.borrowShares == 0) revert NoPosition();
+
+        uint256 currentDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
+        uint256 actualRepay = amount > currentDebt ? currentDebt : amount;
+
+        uint256 sharesToBurn;
+        if (actualRepay == currentDebt) {
+            sharesToBurn = pos.borrowShares;
+        } else {
+            sharesToBurn = _toBorrowShares(actualRepay, Math.Rounding.Floor);
+        }
+
+        uint256 pr = pos.borrowedPrincipal == 0 ? actualRepay
+            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
+            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
+        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
+
+        // Pull USDC from the specified address (Safe), not msg.sender
+        IERC20(asset()).safeTransferFrom(from, address(this), actualRepay);
+
+        pos.borrowShares -= sharesToBurn;
+        _reduceBorrowTracking(tokenId, actualRepay, sharesToBurn, pr);
+
+        emit Repaid(borrower, tokenId, actualRepay);
+    }
+
+    /// @dev Core borrow execution — shared by borrowViaRelay (USDC→EOA) and leverageStep (USDC→Safe).
+    ///      Caller must call _accrueInterest() before this function.
+    /// @param borrower Position owner
+    /// @param tokenId Token ID of the position
+    /// @param amount USDC to borrow (6 decimals)
+    /// @param price Verified oracle price in WAD
+    /// @param maxBorrowDepthCap Depth-gate borrow cap from oracle price data
+    /// @param sendTo Address to receive borrowed USDC
+    function _executeBorrow(
+        address borrower, uint256 tokenId, uint256 amount,
+        uint256 price, uint256 maxBorrowDepthCap, address sendTo
+    ) internal {
+        if (frozenTokens[tokenId]) revert TokenFrozen();
+        if (resolvedMarkets[tokenId].resolved) revert MarketResolved();
+
+        Position storage pos = positions[borrower][tokenId];
         if (pos.collateralAmount == 0) revert NoPosition();
 
         // Check LTV constraint
@@ -568,35 +773,35 @@ contract PredmartLendingPool is
         uint256 collateralValue = pos.collateralAmount.mulDiv(price, 1e18);
         uint256 ltv = getLTV(price);
         uint256 maxBorrow = collateralValue.mulDiv(ltv, 1e18);
-        if (currentDebt + intent.amount > maxBorrow) revert ExceedsLTV();
-        if (currentDebt + intent.amount < MIN_BORROW) revert BorrowTooSmall();
+        if (currentDebt + amount > maxBorrow) revert ExceedsLTV();
+        if (currentDebt + amount < MIN_BORROW) revert BorrowTooSmall();
 
         // Per-token borrow cap
         if (poolCapBps > 0) {
             uint256 tokenCap = totalAssets().mulDiv(poolCapBps, 10000);
-            if (totalBorrowedPerToken[intent.tokenId] + intent.amount > tokenCap) revert ExceedsTokenCap();
+            if (totalBorrowedPerToken[tokenId] + amount > tokenCap) revert ExceedsTokenCap();
         }
 
         // Depth-gate cap
-        if (totalBorrowedPerToken[intent.tokenId] + intent.amount > priceData.maxBorrow) revert DepthCapExceeded();
+        if (totalBorrowedPerToken[tokenId] + amount > maxBorrowDepthCap) revert DepthCapExceeded();
 
         // Check liquidity
-        if (intent.amount > _availableCash()) revert InsufficientLiquidity();
+        if (amount > _availableCash()) revert InsufficientLiquidity();
 
         // Convert amount to borrow shares (round UP)
-        uint256 shares = _toBorrowShares(intent.amount, Math.Rounding.Ceil);
+        uint256 shares = _toBorrowShares(amount, Math.Rounding.Ceil);
 
         // Update state
         pos.borrowShares += shares;
-        pos.borrowedPrincipal += intent.amount;
-        totalBorrowAssets += intent.amount;
+        pos.borrowedPrincipal += amount;
+        totalBorrowAssets += amount;
         totalBorrowShares += shares;
-        totalBorrowedPerToken[intent.tokenId] += intent.amount;
+        totalBorrowedPerToken[tokenId] += amount;
 
-        // Transfer USDC to borrower (not to relayer!)
-        IERC20(asset()).safeTransfer(intent.borrower, intent.amount);
+        // Transfer USDC
+        IERC20(asset()).safeTransfer(sendTo, amount);
 
-        emit Borrowed(intent.borrower, intent.tokenId, intent.amount);
+        emit Borrowed(borrower, tokenId, amount);
     }
 
     /// @notice Repay USDC debt for a position
@@ -720,132 +925,9 @@ contract PredmartLendingPool is
         if (vars.badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, vars.badDebt);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                         MARKET RESOLUTION
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Mark a Polymarket market as resolved. Permissionless — anyone can submit signed resolution data.
-    /// @param tokenId Token ID of the resolved market
-    /// @param data Signed resolution data from oracle
-    function resolveMarket(uint256 tokenId, PredmartOracle.ResolutionData calldata data) external {
-        if (resolvedMarkets[tokenId].resolved) revert MarketAlreadyResolved();
-        if (data.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
-
-        bool won = PredmartOracle.verifyResolution(data, oracle, address(this), MAX_RESOLUTION_AGE);
-        resolvedMarkets[tokenId] = MarketResolution({ resolved: true, won: won });
-
-        emit MarketResolvedEvent(tokenId, won);
-    }
-
-    /// @notice Close a position in a resolved market. Anyone can call.
-    /// @dev If won: position stays open — borrower repays, then withdraws collateral redeemable at $1.
-    ///      If lost: writes off debt as bad debt, socializing the loss across all lenders.
-    /// @param borrower Address of the borrower
-    /// @param tokenId Token ID of the resolved market
-    function closeResolvedPosition(address borrower, uint256 tokenId) external nonReentrant {
-        MarketResolution memory resolution = resolvedMarkets[tokenId];
-        if (!resolution.resolved) revert MarketNotResolved();
-
-        _accrueInterest();
-
-        Position storage pos = positions[borrower][tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-
-        if (resolution.won) {
-            emit PositionClosed(borrower, tokenId, 0);
-        } else {
-            // Losing shares worth $0 — write off bad debt
-            uint256 badDebt = pos.borrowShares > 0
-                ? _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil)
-                : 0;
-            if (pos.borrowShares > 0) {
-                _reduceBorrowTracking(tokenId, badDebt, pos.borrowShares,
-                    pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : badDebt);
-            }
-            delete positions[borrower][tokenId];
-            if (badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, badDebt);
-            emit PositionClosed(borrower, tokenId, badDebt);
-        }
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                       CTF REDEMPTION & SETTLEMENT
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Redeem winning CTF shares for USDC. Permissionless — anyone can call after market resolves won.
-    /// @dev Calls Polymarket CTF redeemPositions(). Burns ALL pool's shares for this tokenId, receives USDC.
-    ///      The conditionId is verified implicitly: if wrong, the pool's tokenId balance won't decrease and the call reverts.
-    /// @param tokenId Token ID of the won market
-    /// @param conditionId Polymarket condition ID (needed by CTF — cannot be derived from tokenId on-chain)
-    /// @param indexSet Index set for this outcome (1 for Yes, 2 for No in binary markets)
-    function redeemWonCollateral(uint256 tokenId, bytes32 conditionId, uint256 indexSet) external nonReentrant {
-        MarketResolution memory resolution = resolvedMarkets[tokenId];
-        if (!resolution.resolved || !resolution.won) revert MarketNotResolved();
-        if (redeemedTokens[tokenId].redeemed) revert AlreadyRedeemed();
-
-        uint256 sharesBefore = ICTF(ctf).balanceOf(address(this), tokenId);
-        uint256 usdcBefore = IERC20(asset()).balanceOf(address(this));
-
-        // Call CTF redeemPositions — redeems all shares for this condition
-        uint256[] memory indexSets = new uint256[](1);
-        indexSets[0] = indexSet;
-        ICTF(ctf).redeemPositions(asset(), bytes32(0), conditionId, indexSets);
-
-        uint256 sharesAfter = ICTF(ctf).balanceOf(address(this), tokenId);
-        uint256 usdcAfter = IERC20(asset()).balanceOf(address(this));
-
-        // Verify our tokenId shares were actually redeemed (validates conditionId + indexSet)
-        if (sharesAfter >= sharesBefore) revert RedemptionFailed();
-
-        uint256 sharesRedeemed = sharesBefore - sharesAfter;
-        uint256 usdcReceived = usdcAfter - usdcBefore;
-        redeemedTokens[tokenId] = Redemption(true, sharesRedeemed, usdcReceived);
-        unsettledRedemptions += usdcReceived;
-
-        emit CollateralRedeemed(tokenId, sharesRedeemed, usdcReceived);
-    }
-
-    /// @notice Settle a borrower's position after CTF redemption. Permissionless — anyone can call.
-    /// @dev Repays debt from redemption proceeds (winning shares = $1 each, so proceeds = collateralAmount).
-    ///      Any surplus after debt repayment is sent to the borrower.
-    /// @param borrower Address of the borrower
-    /// @param tokenId Token ID of the redeemed market
-    function settleRedemption(address borrower, uint256 tokenId) external nonReentrant {
-        Redemption storage redemption = redeemedTokens[tokenId];
-        if (!redemption.redeemed) revert TokenNotRedeemed();
-
-        _accrueInterest();
-
-        Position storage pos = positions[borrower][tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-
-        // Pro-rata proceeds: borrower's share of actual USDC received
-        uint256 proceeds = pos.collateralAmount.mulDiv(redemption.usdcReceived, redemption.totalShares, Math.Rounding.Floor);
-        uint256 debt = pos.borrowShares > 0
-            ? _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil)
-            : 0;
-
-        // Clear borrow tracking
-        if (pos.borrowShares > 0) {
-            _reduceBorrowTracking(tokenId, debt, pos.borrowShares,
-                pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : debt);
-        }
-
-        // Reduce unsettled redemptions by actual proceeds used
-        unsettledRedemptions = unsettledRedemptions > proceeds ? unsettledRedemptions - proceeds : 0;
-
-        // Calculate surplus for borrower (proceeds - debt)
-        uint256 surplus = proceeds > debt ? proceeds - debt : 0;
-        if (debt > proceeds) emit BadDebtAbsorbed(borrower, tokenId, debt - proceeds);
-        delete positions[borrower][tokenId];
-
-        // Send surplus to borrower
-        if (surplus > 0) {
-            IERC20(asset()).safeTransfer(borrower, surplus);
-        }
-
-        emit RedemptionSettled(borrower, tokenId, debt, surplus);
-    }
+    // NOTE: resolveMarket, closeResolvedPosition, redeemWonCollateral, and settleRedemption
+    // have been moved to PredmartPoolExtension to free main contract bytecode space.
+    // They are accessible at the same address via the fallback() → delegatecall pattern.
 
     /*//////////////////////////////////////////////////////////////
                            RISK MODEL
