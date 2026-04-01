@@ -448,13 +448,17 @@ contract PredmartLendingPool is
         return ownerShares < maxAssets ? ownerShares : maxAssets;
     }
 
-    /// @dev Add reentrancy protection + global interest accrual to deposit
+    /// @dev Add reentrancy protection + global interest accrual to deposit.
+    ///      Intentionally lacks whenNotPaused: during emergencies, allowing deposits provides
+    ///      liquidity for repayments and liquidations. Blocking deposits during pause would
+    ///      worsen a liquidity crisis.
     function deposit(uint256 assets, address receiver) public override nonReentrant returns (uint256) {
         _accrueInterest();
         return super.deposit(assets, receiver);
     }
 
-    /// @dev Add reentrancy protection + global interest accrual to mint
+    /// @dev Add reentrancy protection + global interest accrual to mint.
+    ///      Intentionally lacks whenNotPaused (same rationale as deposit — see above).
     function mint(uint256 shares, address receiver) public override nonReentrant returns (uint256) {
         _accrueInterest();
         return super.mint(shares, receiver);
@@ -608,6 +612,13 @@ contract PredmartLendingPool is
     ///      a maximum borrow budget. The contract verifies the signature and tracks cumulative borrowing
     ///      against the budget. The auth is consumed (nonce incremented) on first use and expires at deadline.
     ///      Borrowed USDC goes to auth.allowedFrom (user's Safe) so the user can buy shares on the CLOB.
+    ///
+    ///      NONCE DESIGN (LC-02): Nonce is consumed on first borrow, NOT on deposit-only calls.
+    ///      This is intentional. A leverage loop is multi-step (deposit → borrow → deposit → borrow).
+    ///      If the nonce were consumed on the first deposit-only step, the auth (signed with nonce N)
+    ///      would be bricked — subsequent steps would fail because the contract expects nonce N+1.
+    ///      Deposit-only replay is harmless: it only adds collateral (improving the borrower's HF).
+    ///      The borrow budget (maxBorrow) prevents unbounded borrowing under a single auth.
     /// @param auth The user's leverage authorization (tokenId, maxBorrow budget, nonce, deadline)
     /// @param authSignature The user's EIP-712 signature of the LeverageAuth
     /// @param from Address holding CTF shares (user's Safe for first loop, relayer for subsequent loops)
@@ -644,7 +655,7 @@ contract PredmartLendingPool is
         }
 
         if (borrowAmount > 0) {
-            // Consume nonce on first borrow (not on deposit-only calls)
+            // Consume nonce on first borrow, not on deposit-only calls (see LC-02 NatSpec above)
             if (leverageBorrowUsed[authHash] == 0) {
                 if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
                 leverageNonces[auth.borrower]++;
@@ -665,6 +676,14 @@ contract PredmartLendingPool is
     /// @dev Only callable by the relayer. User must sign a DeleverageAuth EIP-712 message authorizing
     ///      a maximum withdrawal budget. The contract verifies the signature and tracks cumulative withdrawals
     ///      against the budget. Repay happens first (improves HF), then withdrawal (checked against HF).
+    ///
+    ///      NONCE DESIGN (mirrors LC-02 rationale from leverageStep): Nonce is consumed on first
+    ///      withdrawal, NOT on repay-only calls. This is intentional. A deleverage loop may start
+    ///      with a repay-only step (to improve HF before withdrawing). Consuming the nonce on that
+    ///      first repay would brick the auth for subsequent withdrawal steps.
+    ///      Repay-only replay is harmless: repay amount is naturally bounded by outstanding debt,
+    ///      and reducing debt is always beneficial to the borrower. No maxRepay budget is needed
+    ///      because _repayFrom caps the actual transfer to currentDebt (cannot over-repay).
     /// @param auth The user's deleverage authorization (tokenId, maxWithdraw budget, nonce, deadline)
     /// @param authSignature The user's EIP-712 signature of the DeleverageAuth
     /// @param to Destination for withdrawn collateral (user's Safe)
@@ -702,7 +721,7 @@ contract PredmartLendingPool is
         }
 
         if (withdrawAmount > 0) {
-            // Consume nonce on first withdrawal (not on repay-only calls)
+            // Consume nonce on first withdrawal, not on repay-only calls (see LC-02 NatSpec above)
             if (deleverageWithdrawUsed[authHash] == 0) {
                 if (auth.nonce != deleverageNonces[auth.borrower]) revert InvalidNonce();
                 deleverageNonces[auth.borrower]++;
@@ -1019,13 +1038,23 @@ contract PredmartLendingPool is
     //////////////////////////////////////////////////////////////*/
 
     /// @dev Delegate unknown function calls to the extension contract.
+    ///      Reentrancy guard is implemented manually because the Solidity nonReentrant modifier
+    ///      is incompatible with assembly return (return skips modifier cleanup, leaving the guard
+    ///      permanently locked). Uses the same ERC-7201 storage slot as OZ ReentrancyGuard.
     fallback() external {
         address ext = extension;
         if (ext == address(0)) revert InvalidAddress();
+        bytes32 guardSlot = 0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00;
         assembly {
+            if eq(sload(guardSlot), 2) {
+                mstore(0x00, 0x3ee5aeb5) // ReentrancyGuardReentrantCall()
+                revert(0x1c, 0x04)
+            }
+            sstore(guardSlot, 2) // ENTERED
             calldatacopy(0, 0, calldatasize())
             let result := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
             returndatacopy(0, 0, returndatasize())
+            sstore(guardSlot, 1) // NOT_ENTERED
             switch result
             case 0 { revert(0, returndatasize()) }
             default { return(0, returndatasize()) }

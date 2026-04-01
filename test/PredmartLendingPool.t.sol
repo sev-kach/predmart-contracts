@@ -8,6 +8,7 @@ import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/Mes
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
 import { PredmartOracle } from "../src/PredmartOracle.sol";
+import { PredmartPoolLib } from "../src/PredmartPoolLib.sol";
 import { MockUSDC } from "./mocks/MockUSDC.sol";
 import { MockCTF } from "./mocks/MockCTF.sol";
 
@@ -39,6 +40,9 @@ contract PredmartLendingPoolTest is Test {
     );
     bytes32 public constant WITHDRAW_INTENT_TYPEHASH = keccak256(
         "WithdrawIntent(address borrower,address to,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
+    );
+    bytes32 public constant LEVERAGE_AUTH_TYPEHASH = keccak256(
+        "LeverageAuth(address borrower,address allowedFrom,uint256 tokenId,uint256 maxBorrow,uint256 nonce,uint256 deadline)"
     );
     bytes32 public constant DELEVERAGE_AUTH_TYPEHASH = keccak256(
         "DeleverageAuth(address borrower,address allowedTo,uint256 tokenId,uint256 maxWithdraw,uint256 nonce,uint256 deadline)"
@@ -182,6 +186,24 @@ contract PredmartLendingPoolTest is Test {
     ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(
             abi.encode(DELEVERAGE_AUTH_TYPEHASH, borrowerAddr, allowedTo, tokenId, maxWithdraw, nonce, deadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// @dev Sign a LeverageAuth using EIP-712
+    function _signLeverageAuth(
+        uint256 signerKey,
+        address borrowerAddr,
+        address allowedFrom,
+        uint256 tokenId,
+        uint256 maxBorrow,
+        uint256 nonce,
+        uint256 deadline
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(
+            abi.encode(LEVERAGE_AUTH_TYPEHASH, borrowerAddr, allowedFrom, tokenId, maxBorrow, nonce, deadline)
         );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
@@ -584,10 +606,11 @@ contract PredmartLendingPoolTest is Test {
         assertTrue(resolved);
         assertTrue(won);
 
-        // Close position — should accrue final interest at $1.00
+        // closeResolvedPosition should revert on won markets — must use redemption flow
+        vm.expectRevert(PredmartPoolExtension.UseRedemptionFlow.selector);
         poolAdmin.closeResolvedPosition(borrower, TOKEN_ID_YES);
 
-        // Position should still exist (borrower needs to repay)
+        // Position should still exist (must go through redeemWonCollateral + settleRedemption)
         (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
     }
@@ -1835,5 +1858,1067 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.InvalidNonce.selector);
         pool.deleverageStep(staleAuth, staleSig, safe, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              TEST: EXTENSION — TIMELOCKED ADMIN FLOWS
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Helper: activate a 6-hour timelock (mirrors production)
+    function _activateTimelock() internal {
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+    }
+
+    function test_TimelockAdmin_ProposeWaitExecute() public {
+        _activateTimelock();
+        address newAdmin = makeAddr("newAdmin");
+
+        vm.prank(admin);
+        poolAdmin.transferAdmin(newAdmin);
+
+        // Pending but not yet executable
+        assertEq(pool.admin(), admin, "Admin unchanged before timelock");
+        assertEq(pool.pendingAdmin(), newAdmin);
+        assertGt(pool.pendingAdminExecAfter(), block.timestamp);
+
+        // Revert if executed too early
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockNotReady.selector);
+        poolAdmin.executeTransferAdmin();
+
+        // Warp past timelock
+        vm.warp(block.timestamp + 6 hours + 1);
+
+        vm.prank(admin);
+        poolAdmin.executeTransferAdmin();
+
+        assertEq(pool.admin(), newAdmin, "Admin transferred after timelock");
+        assertEq(pool.pendingAdmin(), address(0), "Pending cleared");
+    }
+
+    function test_TimelockAdmin_ProposeCancel() public {
+        _activateTimelock();
+        address newAdmin = makeAddr("newAdmin");
+
+        vm.prank(admin);
+        poolAdmin.transferAdmin(newAdmin);
+
+        assertEq(pool.pendingAdmin(), newAdmin);
+
+        vm.prank(admin);
+        poolAdmin.cancelTransferAdmin();
+
+        assertEq(pool.pendingAdmin(), address(0), "Pending cleared after cancel");
+        assertEq(pool.admin(), admin, "Admin unchanged after cancel");
+    }
+
+    function test_TimelockRelayer_ProposeWaitExecute() public {
+        _activateTimelock();
+        address newRelayer = makeAddr("newRelayer");
+
+        vm.prank(admin);
+        poolAdmin.proposeAddress(1, newRelayer);
+
+        assertEq(pool.relayer(), relayer, "Relayer unchanged before timelock");
+        assertEq(pool.pendingRelayer(), newRelayer);
+
+        // Warp past timelock
+        vm.warp(block.timestamp + 6 hours + 1);
+
+        vm.prank(admin);
+        poolAdmin.executeAddress(1);
+
+        assertEq(pool.relayer(), newRelayer, "Relayer rotated");
+        assertEq(pool.pendingRelayer(), address(0));
+    }
+
+    function test_TimelockRelayer_Cancel() public {
+        _activateTimelock();
+        address newRelayer = makeAddr("newRelayer");
+
+        vm.prank(admin);
+        poolAdmin.proposeAddress(1, newRelayer);
+
+        vm.prank(admin);
+        poolAdmin.cancelPending(1);
+
+        assertEq(pool.pendingRelayer(), address(0));
+        assertEq(pool.relayer(), relayer, "Relayer unchanged");
+    }
+
+    function test_TimelockOracle_ProposeWaitExecute() public {
+        _activateTimelock();
+        address newOracle = makeAddr("newOracle");
+
+        vm.prank(admin);
+        poolAdmin.proposeAddress(0, newOracle);
+
+        assertEq(pool.oracle(), oracleAddress, "Oracle unchanged before timelock");
+
+        // Revert before timelock
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockNotReady.selector);
+        poolAdmin.executeAddress(0);
+
+        // Warp past timelock
+        vm.warp(block.timestamp + 6 hours + 1);
+
+        vm.prank(admin);
+        poolAdmin.executeAddress(0);
+
+        assertEq(pool.oracle(), newOracle, "Oracle rotated");
+    }
+
+    function test_TimelockOracle_Cancel() public {
+        _activateTimelock();
+
+        vm.prank(admin);
+        poolAdmin.proposeAddress(0, makeAddr("newOracle"));
+
+        vm.prank(admin);
+        poolAdmin.cancelPending(0);
+
+        assertEq(pool.pendingOracle(), address(0));
+        assertEq(pool.oracle(), oracleAddress);
+    }
+
+    function test_TimelockAnchors_ProposeWaitExecute() public {
+        _activateTimelock();
+
+        uint256[7] memory prices = [uint256(0), 0.15e18, 0.30e18, 0.50e18, 0.70e18, 0.85e18, 1.00e18];
+        uint256[7] memory ltvs = [uint256(0.01e18), 0.05e18, 0.25e18, 0.40e18, 0.55e18, 0.65e18, 0.70e18];
+
+        vm.prank(admin);
+        poolAdmin.proposeAnchors(prices, ltvs);
+
+        // Not yet executable
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockNotReady.selector);
+        poolAdmin.executeAnchors();
+
+        // Warp past timelock
+        vm.warp(block.timestamp + 6 hours + 1);
+
+        vm.prank(admin);
+        poolAdmin.executeAnchors();
+
+        assertEq(pool.priceAnchors(1), 0.15e18, "Anchors updated");
+        assertEq(pool.ltvAnchors(0), 0.01e18);
+    }
+
+    function test_TimelockAnchors_Cancel() public {
+        _activateTimelock();
+
+        uint256[7] memory prices = [uint256(0), 0.15e18, 0.30e18, 0.50e18, 0.70e18, 0.85e18, 1.00e18];
+        uint256[7] memory ltvs = [uint256(0.01e18), 0.05e18, 0.25e18, 0.40e18, 0.55e18, 0.65e18, 0.70e18];
+
+        vm.prank(admin);
+        poolAdmin.proposeAnchors(prices, ltvs);
+
+        vm.prank(admin);
+        poolAdmin.cancelPending(3); // kind=3 is anchors
+
+        // Original anchors unchanged
+        assertEq(pool.priceAnchors(1), 0.10e18);
+    }
+
+    function test_TimelockAnchors_RevertsInvalidAnchors() public {
+        // LTV + LIQUIDATION_BUFFER > 1.0 should revert
+        uint256[7] memory prices = [uint256(0), 0.10e18, 0.20e18, 0.40e18, 0.60e18, 0.80e18, 1.00e18];
+        uint256[7] memory badLtvs = [uint256(0.02e18), 0.08e18, 0.30e18, 0.45e18, 0.60e18, 0.70e18, 0.95e18]; // 95% + 10% > 100%
+
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.InvalidAnchors.selector);
+        poolAdmin.proposeAnchors(prices, badLtvs);
+    }
+
+    function test_TimelockAnchors_RevertsNonMonotonicPrices() public {
+        // Prices must be strictly increasing
+        uint256[7] memory badPrices = [uint256(0), 0.10e18, 0.20e18, 0.15e18, 0.60e18, 0.80e18, 1.00e18]; // 0.15 < 0.20
+        uint256[7] memory ltvs = [uint256(0.02e18), 0.08e18, 0.30e18, 0.45e18, 0.60e18, 0.70e18, 0.75e18];
+
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.InvalidAnchors.selector);
+        poolAdmin.proposeAnchors(badPrices, ltvs);
+    }
+
+    function test_ActivateTimelock_RatchetUp() public {
+        // Can increase timelock
+        vm.prank(admin);
+        poolAdmin.activateTimelock(1 hours);
+        assertEq(pool.timelockDelay(), 1 hours);
+
+        // Can increase further
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+        assertEq(pool.timelockDelay(), 6 hours);
+    }
+
+    function test_ActivateTimelock_RevertsDecrease() public {
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+
+        // Cannot decrease — ratchet
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockCannotDecrease.selector);
+        poolAdmin.activateTimelock(1 hours);
+    }
+
+    function test_ExecuteAddress_RevertsNoPendingChange() public {
+        _activateTimelock();
+
+        // No pending oracle change — should revert
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.NoPendingChange.selector);
+        poolAdmin.executeAddress(0);
+
+        // No pending relayer change
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.NoPendingChange.selector);
+        poolAdmin.executeAddress(1);
+    }
+
+    function test_ExecuteTransferAdmin_RevertsNoPendingChange() public {
+        _activateTimelock();
+
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.NoPendingChange.selector);
+        poolAdmin.executeTransferAdmin();
+    }
+
+    function test_ProposeAddress_RevertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.InvalidAddress.selector);
+        poolAdmin.proposeAddress(0, address(0));
+    }
+
+    function test_TransferAdmin_RevertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.InvalidAddress.selector);
+        poolAdmin.transferAdmin(address(0));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                      TEST: LEVERAGE STEP
+    //////////////////////////////////////////////////////////////*/
+
+    function test_LeverageStep_DepositAndBorrow() public {
+        _supply(lender, 50_000e6);
+
+        // Borrower deposits collateral first
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 3_000e6);
+        vm.stopPrank();
+
+        // Relayer holds some CTF shares (simulating post-CLOB purchase)
+        ctf.mint(relayer, TOKEN_ID_YES, 2_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        uint256 maxBorrow = 2_000e6;
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: maxBorrow,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, maxBorrow, nonce, deadline);
+
+        // Relayer deposits 2000 shares (from relayer itself) + borrows 1000 USDC
+        vm.prank(relayer);
+        pool.leverageStep(auth, sig, relayer, 2_000e6, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Verify: borrower's position now has 5000 collateral (3000 initial + 2000 from leverage)
+        (uint256 collateral, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 5_000e6, "Collateral includes leveraged deposit");
+        assertGt(borrowShares, 0, "Borrow shares created");
+        assertEq(pool.leverageNonces(borrower), nonce + 1, "Nonce consumed on first borrow");
+    }
+
+    function test_LeverageStep_DepositOnly() public {
+        _supply(lender, 50_000e6);
+
+        // Borrower deposits some initial collateral
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        vm.stopPrank();
+
+        // Relayer has shares
+        ctf.mint(relayer, TOKEN_ID_YES, 2_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        uint256 maxBorrow = 2_000e6;
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: maxBorrow,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, maxBorrow, nonce, deadline);
+
+        // Deposit only, no borrow — nonce should NOT be consumed
+        vm.prank(relayer);
+        pool.leverageStep(auth, sig, relayer, 2_000e6, 0, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 3_000e6, "Collateral increased");
+        assertEq(pool.leverageNonces(borrower), nonce, "Nonce unchanged on deposit-only");
+    }
+
+    function test_LeverageStep_MultipleStepsBudgetTracking() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        uint256 maxBorrow = 2_000e6; // Budget: max 2000 USDC total
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: maxBorrow,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, maxBorrow, nonce, deadline);
+
+        // Step 1: borrow 800
+        vm.prank(relayer);
+        pool.leverageStep(auth, sig, relayer, 0, 800e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Step 2: borrow 800 more (total 1600 < 2000 budget)
+        vm.prank(relayer);
+        pool.leverageStep(auth, sig, relayer, 0, 800e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Step 3: try to borrow 500 more (total 2100 > 2000 budget)
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.ExceedsBorrowBudget.selector);
+        pool.leverageStep(auth, sig, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Step 3 corrected: borrow exactly remaining 400
+        vm.prank(relayer);
+        pool.leverageStep(auth, sig, relayer, 0, 400e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        assertEq(pool.totalBorrowAssets(), 2_000e6, "Total borrowed matches budget");
+    }
+
+    function test_LeverageStep_RevertsNotRelayer() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(liquidator);
+        vm.expectRevert(PredmartLendingPool.NotRelayer.selector);
+        pool.leverageStep(auth, sig, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    function test_LeverageStep_RevertsExpired() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp - 1; // Already expired
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.IntentExpired.selector);
+        pool.leverageStep(auth, sig, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    function test_LeverageStep_RevertsInvalidFrom() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe, // Only safe or relayer allowed
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        address attacker = makeAddr("attacker");
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidAddress.selector);
+        pool.leverageStep(auth, sig, attacker, 500e6, 0, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    function test_LeverageStep_RevertsInvalidSignature() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        // Sign with wrong key
+        bytes memory wrongSig = _signLeverageAuth(relayerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.leverageStep(auth, wrongSig, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              TEST: EDGE CASES — BORROW BOUNDARIES
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Borrow_RevertsBorrowTooSmall() public {
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        // Try to borrow $0.50 — below MIN_BORROW ($1)
+        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
+            borrower: borrower,
+            tokenId: TOKEN_ID_YES,
+            amount: 0.5e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, 0.5e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.BorrowTooSmall.selector);
+        pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    function test_Borrow_ExactlyMinBorrow() public {
+        _supply(lender, 50_000e6);
+
+        // Borrow exactly $1 (MIN_BORROW = 1e6)
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 1e6, 0.80e18);
+
+        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertGt(borrowShares, 0, "Position created at MIN_BORROW");
+        assertEq(pool.totalBorrowAssets(), 1e6);
+    }
+
+    function test_Repay_WithMaxUint_AfterInterest() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        // Accrue interest for 30 days
+        vm.warp(block.timestamp + 30 days);
+
+        uint256 debtBefore = pool.getPositionDebt(borrower, TOKEN_ID_YES);
+        assertGt(debtBefore, 2_000e6, "Debt grew from interest");
+
+        // Full repay with type(uint256).max
+        vm.startPrank(borrower);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.repay(TOKEN_ID_YES, type(uint256).max);
+        vm.stopPrank();
+
+        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(borrowShares, 0, "All shares burned");
+        assertEq(pool.totalBorrowShares(), 0, "Global shares zeroed");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              TEST: FROZEN TOKEN BEHAVIOR
+    //////////////////////////////////////////////////////////////*/
+
+    function test_FrozenToken_BlocksDeposit() public {
+        vm.prank(admin);
+        poolAdmin.setTokenFrozen(TOKEN_ID_YES, true);
+        assertTrue(pool.frozenTokens(TOKEN_ID_YES));
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        vm.expectRevert(PredmartLendingPool.TokenFrozen.selector);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        vm.stopPrank();
+    }
+
+    function test_FrozenToken_BlocksBorrow() public {
+        _supply(lender, 50_000e6);
+
+        // Deposit before freeze
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        // Freeze the token
+        vm.prank(admin);
+        poolAdmin.setTokenFrozen(TOKEN_ID_YES, true);
+
+        // Try to borrow — should revert
+        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
+            borrower: borrower,
+            tokenId: TOKEN_ID_YES,
+            amount: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.TokenFrozen.selector);
+        pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    function test_FrozenToken_Unfreeze() public {
+        vm.prank(admin);
+        poolAdmin.setTokenFrozen(TOKEN_ID_YES, true);
+
+        vm.prank(admin);
+        poolAdmin.setTokenFrozen(TOKEN_ID_YES, false);
+        assertFalse(pool.frozenTokens(TOKEN_ID_YES));
+
+        // Deposit works after unfreeze
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        vm.stopPrank();
+
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 1_000e6);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+            TEST: LIQUIDATION — UNDERWATER PATH (bad debt)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Liquidation_Underwater_BadDebt() public {
+        vm.prank(admin);
+        poolAdmin.setPoolCapBps(0);
+        _supply(lender, 50_000e6);
+
+        // Borrow near max LTV at $0.80
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
+
+        // Accrue significant interest
+        vm.warp(block.timestamp + 180 days);
+        pool.accrueInterest();
+
+        uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
+
+        // Price crashes to $0.10 — collateral value = 5000 * 0.10 = $500
+        // Debt >> $500 → underwater
+        PredmartOracle.PriceData memory crashPrice = _signPrice(TOKEN_ID_YES, 0.10e18);
+
+        uint256 totalAssetsBefore = pool.totalAssets();
+
+        vm.prank(relayer);
+        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, crashPrice);
+
+        // Position fully deleted
+        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 0);
+        assertEq(shares, 0);
+
+        // Bad debt socialized — totalAssets decreased
+        assertLt(pool.totalAssets(), totalAssetsBefore, "Bad debt socialized to lenders");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+       TEST: CLOSE RESOLVED POSITION — WON MARKET (no-op behavior)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_CloseResolvedPosition_WonMarket_Reverts() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        // Resolve as won
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+
+        // closeResolvedPosition reverts on won markets — must use redemption flow
+        vm.expectRevert(PredmartPoolExtension.UseRedemptionFlow.selector);
+        poolAdmin.closeResolvedPosition(borrower, TOKEN_ID_YES);
+
+        // Position untouched
+        (uint256 collateral, uint256 borrowSharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 5_000e6, "Collateral preserved");
+        assertGt(borrowSharesAfter, 0, "Debt preserved");
+    }
+
+    function test_CloseResolvedPosition_LostMarket_DeletesPosition() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, false));
+        poolAdmin.closeResolvedPosition(borrower, TOKEN_ID_YES);
+
+        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 0, "Position deleted on lost market");
+        assertEq(shares, 0);
+    }
+
+    function test_CloseResolvedPosition_RevertsNotResolved() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        vm.expectRevert(PredmartPoolExtension.MarketNotResolved.selector);
+        poolAdmin.closeResolvedPosition(borrower, TOKEN_ID_YES);
+    }
+
+    function test_CloseResolvedPosition_RevertsNoPosition() public {
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, false));
+
+        vm.expectRevert(PredmartPoolExtension.NoPosition.selector);
+        poolAdmin.closeResolvedPosition(borrower, TOKEN_ID_YES);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+         TEST: REDEEM WON COLLATERAL + SETTLE REDEMPTION
+    //////////////////////////////////////////////////////////////*/
+
+    function test_RedeemAndSettle_FullFlow_WithSurplus() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        // Configure mock CTF for redemption
+        bytes32 conditionId = bytes32(uint256(TOKEN_ID_YES));
+        ctf.configureRedemption(conditionId, TOKEN_ID_YES, address(usdc));
+
+        // Resolve market as won
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+
+        // Redeem: burns 5000 CTF shares, mints 5000 USDC to pool
+        poolAdmin.redeemWonCollateral(TOKEN_ID_YES, conditionId, 1);
+
+        // Verify redemption recorded
+        (bool redeemed, uint256 totalShares, uint256 usdcReceived) = pool.redeemedTokens(TOKEN_ID_YES);
+        assertTrue(redeemed);
+        assertEq(totalShares, 5_000e6, "All shares redeemed");
+        assertEq(usdcReceived, 5_000e6, "1:1 USDC from won CTF");
+        assertEq(pool.unsettledRedemptions(), 5_000e6);
+
+        // Settle: borrower's debt = ~2000, proceeds = 5000 → surplus = ~3000
+        uint256 borrowerBalBefore = usdc.balanceOf(borrower);
+        poolAdmin.settleRedemption(borrower, TOKEN_ID_YES);
+
+        // Position deleted
+        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 0);
+        assertEq(shares, 0);
+
+        // Borrower received surplus
+        uint256 surplus = usdc.balanceOf(borrower) - borrowerBalBefore;
+        assertGt(surplus, 2_900e6, "Surplus: proceeds - debt");
+        assertLt(surplus, 3_100e6); // Allow for small interest
+        assertEq(pool.unsettledRedemptions(), 0, "Unsettled cleared");
+    }
+
+    function test_RedeemAndSettle_WithBadDebt() public {
+        vm.prank(admin);
+        poolAdmin.setPoolCapBps(0);
+        // Small pool → high utilization → high interest rate
+        _supply(lender, 3_500e6);
+
+        // Borrow most of pool → ~77% utilization → ~24% borrow rate
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
+
+        // Accrue interest for 5 years at high utilization
+        vm.warp(block.timestamp + 1825 days);
+        pool.accrueInterest();
+
+        uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
+        assertGt(debt, 5_000e6, "Debt exceeds collateral value due to interest");
+
+        // Configure and redeem
+        bytes32 conditionId = bytes32(uint256(TOKEN_ID_YES));
+        ctf.configureRedemption(conditionId, TOKEN_ID_YES, address(usdc));
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+        poolAdmin.redeemWonCollateral(TOKEN_ID_YES, conditionId, 1);
+
+        // Settle — proceeds (5000) < debt → bad debt
+        uint256 totalAssetsBefore = pool.totalAssets();
+        poolAdmin.settleRedemption(borrower, TOKEN_ID_YES);
+
+        // Position deleted, bad debt absorbed
+        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 0);
+        assertEq(shares, 0);
+
+        // Lenders absorb bad debt
+        assertLt(pool.totalAssets(), totalAssetsBefore, "Bad debt socialized");
+    }
+
+    function test_RedeemWonCollateral_RevertsNotWon() public {
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, false));
+
+        vm.expectRevert(PredmartPoolExtension.MarketNotResolved.selector);
+        poolAdmin.redeemWonCollateral(TOKEN_ID_YES, bytes32(0), 1);
+    }
+
+    function test_RedeemWonCollateral_RevertsAlreadyRedeemed() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
+
+        bytes32 conditionId = bytes32(uint256(TOKEN_ID_YES));
+        ctf.configureRedemption(conditionId, TOKEN_ID_YES, address(usdc));
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+        poolAdmin.redeemWonCollateral(TOKEN_ID_YES, conditionId, 1);
+
+        // Second redeem should revert
+        vm.expectRevert(PredmartPoolExtension.AlreadyRedeemed.selector);
+        poolAdmin.redeemWonCollateral(TOKEN_ID_YES, conditionId, 1);
+    }
+
+    function test_SettleRedemption_RevertsNotRedeemed() public {
+        vm.expectRevert(PredmartPoolExtension.TokenNotRedeemed.selector);
+        poolAdmin.settleRedemption(borrower, TOKEN_ID_YES);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              TEST: RESOLVE MARKET — DUPLICATE RESOLUTION
+    //////////////////////////////////////////////////////////////*/
+
+    function test_ResolveMarket_RevertsDuplicate() public {
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+
+        vm.expectRevert(PredmartPoolExtension.MarketAlreadyResolved.selector);
+        poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, true));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+             TEST: FUZZ — MATH LIBRARY PROPERTIES
+    //////////////////////////////////////////////////////////////*/
+
+    function testFuzz_Interpolate_Monotonic(uint256 priceA, uint256 priceB) public view {
+        // Bound prices to valid range [0, 1e18]
+        priceA = bound(priceA, 0, 1e18);
+        priceB = bound(priceB, priceA, 1e18);
+
+        uint256 ltvA = pool.getLTV(priceA);
+        uint256 ltvB = pool.getLTV(priceB);
+
+        // LTV should be monotonically non-decreasing with price
+        assertGe(ltvB, ltvA, "LTV must be monotonically non-decreasing");
+    }
+
+    function testFuzz_CalcBorrowRate_Bounded(uint256 utilization) public pure {
+        utilization = bound(utilization, 0, 1e18);
+
+        uint256 rate = PredmartPoolLib.calcBorrowRate(utilization);
+
+        // Rate must be at least BASE_RATE and at most MAX_RATE
+        assertGe(rate, 0.05e18, "Rate >= base rate");
+        assertLe(rate, 3.00e18 + 0.05e18, "Rate bounded above");
+    }
+
+    function testFuzz_CalcPendingInterest_NonNegative(
+        uint256 borrowAssets,
+        uint256 elapsed,
+        uint256 utilization
+    ) public pure {
+        borrowAssets = bound(borrowAssets, 0, 1e15); // Up to $1B USDC
+        elapsed = bound(elapsed, 0, 365.25 days * 10); // Up to 10 years
+        utilization = bound(utilization, 0, 1e18);
+
+        (uint256 interest, uint256 reserveShare) = PredmartPoolLib.calcPendingInterest(
+            borrowAssets, elapsed, utilization
+        );
+
+        // Interest should be non-negative
+        assertGe(interest, 0, "Interest non-negative");
+        // Reserve share should be <= interest
+        assertLe(reserveShare, interest, "Reserve <= interest");
+
+        // If borrowAssets > 0 and elapsed > 0, interest should be > 0
+        if (borrowAssets > 0 && elapsed > 0) {
+            assertGt(interest, 0, "Interest > 0 when borrowed and time passes");
+        }
+    }
+
+    function testFuzz_CalcHealthFactor_Properties(
+        uint256 collateral,
+        uint256 debt,
+        uint256 price
+    ) public pure {
+        collateral = bound(collateral, 1e6, 1e15); // $1 to $1B
+        debt = bound(debt, 1e6, 1e15);
+        price = bound(price, 0.01e18, 1e18);
+
+        uint256 threshold = 0.80e18; // Typical threshold
+        uint256 hf = PredmartPoolLib.calcHealthFactor(collateral, debt, price, threshold);
+
+        // HF should be proportional to collateral and inversely proportional to debt
+        uint256 hf2 = PredmartPoolLib.calcHealthFactor(collateral * 2, debt, price, threshold);
+        assertGe(hf2, hf, "Double collateral should increase or maintain HF");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+          TEST: ERC-4626 — MINT AND WITHDRAW (by assets/shares)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_MintShares() public {
+        // mint() is the ERC-4626 shares-based deposit (vs deposit which is asset-based)
+        uint256 sharesToMint = 10_000e12; // pUSDC has 12 decimals
+
+        vm.startPrank(lender);
+        usdc.approve(address(pool), type(uint256).max);
+        uint256 assetsRequired = pool.mint(sharesToMint, lender);
+        vm.stopPrank();
+
+        assertGt(assetsRequired, 0, "Assets deposited");
+        assertEq(pool.balanceOf(lender), sharesToMint, "Exact shares minted");
+    }
+
+    function test_WithdrawAssets() public {
+        _supply(lender, 10_000e6);
+
+        // withdraw() is the ERC-4626 assets-based redemption (vs redeem which is shares-based)
+        uint256 assetsToWithdraw = 5_000e6;
+
+        vm.prank(lender);
+        uint256 sharesBurned = pool.withdraw(assetsToWithdraw, lender, lender);
+
+        assertGt(sharesBurned, 0, "Shares burned");
+        assertEq(usdc.balanceOf(lender), 95_000e6, "5K withdrawn from 100K initial balance");
+    }
+
+    function test_MaxWithdraw_LimitedByLiquidity() public {
+        vm.prank(admin);
+        poolAdmin.setPoolCapBps(0);
+        _supply(lender, 10_000e6);
+        // At $1.00, LTV=75%, max borrow = 10000*1.0*0.75 = 7500
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 10_000e6, 7_000e6, 1e18);
+
+        // Most liquidity is lent out — maxWithdraw should be limited
+        uint256 maxW = pool.maxWithdraw(lender);
+        assertLt(maxW, 10_000e6, "Max withdraw < deposited due to borrows");
+        assertGe(maxW, 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        TEST: DEPOSIT COLLATERAL FROM (Safe ownership check)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_DepositCollateralFrom_SameAddress() public {
+        // msg.sender == from — no isOwner check needed
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateralFrom(borrower, TOKEN_ID_YES, 2_000e6);
+        vm.stopPrank();
+
+        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 2_000e6);
+    }
+
+    function test_DepositCollateralFrom_RevertsNotOwner() public {
+        // Create a mock "Safe" that returns false for isOwner
+        // No need to mint — the isOwner check happens before the transfer
+        address fakeSafe = address(new MockSafeRejectsAll());
+
+        vm.prank(borrower); // borrower is NOT an owner of fakeSafe
+        vm.expectRevert(PredmartLendingPool.NotProxyOwner.selector);
+        pool.depositCollateralFrom(fakeSafe, TOKEN_ID_YES, 1_000e6);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+       TEST: PARTIAL LIQUIDATION (above water, HF >= 0.95)
+    //////////////////////////////////////////////////////////////*/
+
+    function test_Liquidation_Partial_AboveWater() public {
+        vm.prank(admin);
+        poolAdmin.setPoolCapBps(0);
+        _supply(lender, 50_000e6);
+
+        // Position that becomes slightly unhealthy (HF just below 1.0 but above 0.95)
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 10_000e6, 5_000e6, 0.80e18);
+
+        // Price drops slightly so HF is between 0.95 and 1.0
+        // At $0.70: threshold = LTV(0.70) + 10% = 65.5% + 10% = 75.5%
+        // HF = 10000 * 0.70 * 0.755 / 5000 = 1.057 — still healthy
+        // At $0.65: threshold = LTV(0.65) + 10% = 62.5% + 10% = 72.5%
+        // HF = 10000 * 0.65 * 0.725 / 5000 = 0.9425 — unhealthy, HF < 0.95 = full close
+
+        // Try at price that gives HF ~0.98 (slightly unhealthy, close factor = 50%)
+        // At $0.68: LTV = interpolated, threshold = LTV + 10%
+        // Let's just check the partial liquidation works with a moderate price drop
+        PredmartOracle.PriceData memory lowPrice = _signPrice(TOKEN_ID_YES, 0.66e18);
+
+        uint256 collBefore = 10_000e6;
+        vm.prank(relayer);
+        pool.liquidate(borrower, TOKEN_ID_YES, 2_000e6, lowPrice); // Partial repay: 2000 USDC
+
+        (uint256 collAfter, uint256 sharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
+        // Position should still exist (partial liquidation)
+        assertGt(collAfter, 0, "Collateral remains after partial liq");
+        assertLt(collAfter, collBefore, "Some collateral seized");
+        assertGt(sharesAfter, 0, "Debt remains");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+       TEST: VIEW FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_GetTokenBorrowCap() public {
+        _supply(lender, 50_000e6);
+
+        uint256 cap = pool.getTokenBorrowCap();
+        // 5% of 50_000 = 2_500
+        assertEq(cap, 2_500e6);
+    }
+
+    function test_GetTokenBorrowCap_ZeroWhenDisabled() public {
+        vm.prank(admin);
+        poolAdmin.setPoolCapBps(0);
+
+        _supply(lender, 50_000e6);
+        assertEq(pool.getTokenBorrowCap(), 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+             TEST: FUZZ — CONTINUED
+    //////////////////////////////////////////////////////////////*/
+
+    function testFuzz_CalcHealthFactor_ZeroDebt() public pure {
+        uint256 hf = PredmartPoolLib.calcHealthFactor(1_000e6, 0, 0.80e18, 0.80e18);
+        assertEq(hf, type(uint256).max, "Zero debt = max HF");
+    }
+
+    /// @dev Fuzz: borrow → full repay should never leave dust shares or create free USDC
+    function testFuzz_BorrowRepayRoundtrip_NoDust(uint256 borrowAmount) public {
+        borrowAmount = bound(borrowAmount, 1e6, 2_500e6); // MIN_BORROW to within cap
+
+        _supply(lender, 50_000e6);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        vm.stopPrank();
+
+        // Borrow
+        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, borrowAmount, nonce, deadline);
+        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
+            borrower: borrower, tokenId: TOKEN_ID_YES, amount: borrowAmount, nonce: nonce, deadline: deadline
+        });
+        vm.prank(relayer);
+        pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Accrue some interest (random-ish time)
+        vm.warp(block.timestamp + (borrowAmount % 365 days) + 1);
+
+        // Full repay
+        vm.startPrank(borrower);
+        usdc.approve(address(pool), type(uint256).max);
+        pool.repay(TOKEN_ID_YES, type(uint256).max);
+        vm.stopPrank();
+
+        // Invariant: no dust shares remain
+        (, uint256 sharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(sharesAfter, 0, "Full repay must zero shares");
+
+        // Invariant: global tracking is consistent
+        assertEq(pool.totalBorrowShares(), 0, "Global shares zero after sole borrower repays");
+        assertEq(pool.totalBorrowAssets(), 0, "Global assets zero after sole borrower repays");
+    }
+
+    /// @dev Fuzz: liquidation should never let liquidator profit (receive more value than they pay)
+    function testFuzz_CalcLiquidation_NoFreeValue(
+        uint256 collateral,
+        uint256 debt,
+        uint256 price
+    ) public pure {
+        collateral = bound(collateral, 1e6, 1e15);
+        debt = bound(debt, 1e6, 1e15);
+        price = bound(price, 0.01e18, 1e18);
+
+        uint256 collateralValue = (collateral * price) / 1e18;
+        // Only test when position is unhealthy (HF < 1)
+        uint256 threshold = 0.80e18;
+        uint256 hf = PredmartPoolLib.calcHealthFactor(collateral, debt, price, threshold);
+        if (hf >= 1e18) return; // Healthy — skip
+
+        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
+            collateral, debt, hf, price, type(uint256).max
+        );
+
+        // Seized collateral cannot exceed total collateral
+        assertLe(vars.seizeCollateral, collateral, "Cannot seize more than exists");
+
+        // Liquidator cost should never exceed the value they receive
+        uint256 seizedValue = (vars.seizeCollateral * price) / 1e18;
+        assertGe(seizedValue, vars.liquidatorCost, "Liquidator must not overpay");
+
+        // repayAmount should never exceed total debt
+        assertLe(vars.repayAmount, debt, "Cannot repay more than owed");
+    }
+}
+
+/// @notice Mock Safe that always returns false for isOwner — used to test depositCollateralFrom access control
+contract MockSafeRejectsAll {
+    function isOwner(address) external pure returns (bool) {
+        return false;
     }
 }

@@ -43,6 +43,7 @@ contract PredmartPoolExtension {
     error TokenNotRedeemed();
     error AlreadyRedeemed();
     error RedemptionFailed();
+    error UseRedemptionFlow();
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -136,6 +137,10 @@ contract PredmartPoolExtension {
     // v1.0.0 — Leverage (must match PredmartLendingPool storage layout)
     mapping(address => uint256) public leverageNonces;
     mapping(bytes32 => uint256) public leverageBorrowUsed;
+
+    // v1.1.0 — Deleverage loop authorization
+    mapping(address => uint256) public deleverageNonces;
+    mapping(bytes32 => uint256) public deleverageWithdrawUsed;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -355,7 +360,7 @@ contract PredmartPoolExtension {
         if (pos.collateralAmount == 0) revert NoPosition();
 
         if (resolution.won) {
-            emit PositionClosed(borrower, tokenId, 0);
+            revert UseRedemptionFlow();
         } else {
             uint256 badDebt = pos.borrowShares > 0
                 ? _toBorrowAssetsInline(pos.borrowShares)
