@@ -42,6 +42,7 @@ The protocol is split across two contracts that share a single proxy address:
 - **Collateral Manager** — tracks per-user, per-token ERC-1155 collateral deposits and loan positions
 - **Meta-Transaction Relayer** — all borrow, withdraw, and leverage operations use EIP-712 signed intents submitted by a trusted relayer, eliminating the need for users to hold gas tokens
 - **Leverage Engine** — `leverageStep()` enables iterative deposit-and-borrow loops: users sign a single `LeverageAuth` message authorizing a maximum borrow budget, and the relayer executes multiple steps within that budget. Borrowed USDC goes to the user's Safe (`auth.allowedFrom`), not the relayer
+- **Deleverage Engine** — `deleverageStep()` enables iterative repay-and-withdraw loops: users sign a single `DeleverageAuth` message authorizing a maximum withdrawal budget, and the relayer executes multiple steps. Repayment happens first (improving health factor), then collateral withdrawal — ensuring the position stays healthy throughout unwinding
 - **Interest Rate Model** — kinked utilization-based curve: low rates at low utilization, sharply rising rates above the kink to incentivize liquidity
 - **Dynamic LTV Curve** — 7-anchor price interpolation that adjusts the loan-to-value ratio based on current collateral price; shares closer to $1.00 receive higher LTV
 - **Oracle Verifier** — validates cryptographically signed, timestamp-bounded price data; rejects data older than 10 seconds
@@ -67,6 +68,7 @@ Users never submit transactions directly. Instead, they sign EIP-712 typed data 
 - **BorrowIntent** — signed by the borrower, specifies amount, token, and destination
 - **WithdrawIntent** — signed by the borrower, specifies amount, token, and withdrawal destination
 - **LeverageAuth** — signed once per leverage operation, authorizes a cumulative borrow budget with an explicit `allowedFrom` address (user's Gnosis Safe) where USDC is sent
+- **DeleverageAuth** — signed once per deleverage operation, authorizes a cumulative withdrawal budget with an explicit `allowedTo` address (user's Gnosis Safe) where collateral is returned
 
 ### Upgradeability
 
@@ -225,7 +227,7 @@ Managed as git submodules via Foundry:
 - **Depth-gated borrow caps:** Maximum borrowable amount per token is capped by that token's orderbook liquidity on Polymarket, preventing concentration in illiquid markets.
 - **Emergency pause:** Admin can pause the protocol instantly. Pausing blocks new borrows, deposits, and leverage — but repayments, withdrawals, and liquidations remain open so users can exit.
 - **Price drop guard:** New borrows are automatically blocked during rapid collateral price crashes.
-- **Replay protection:** Separate nonce sequences for borrow, withdraw, and leverage operations prevent cross-operation replay attacks.
+- **Replay protection:** Separate nonce sequences for borrow, withdraw, leverage, and deleverage operations prevent cross-operation replay attacks.
 
 For a full security breakdown, see the [Security documentation](https://predmart.com/docs/security).
 
