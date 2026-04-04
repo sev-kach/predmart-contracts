@@ -56,7 +56,7 @@ contract Deploy is Script {
     /// @notice Fresh deployment: LendingPool implementation + proxy
     /// @dev forge script script/Deploy.s.sol --sig "deployLendingPool()" --rpc-url polygon_mainnet --broadcast --verify
     function deployLendingPool() external {
-        uint256 deployerPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
 
         console.log("=== DEPLOY LENDING POOL ===");
@@ -95,7 +95,7 @@ contract Deploy is Script {
     /// @notice Deploy new impl + extension only (no proposeAddress — use when admin is a Safe)
     /// @dev forge script script/Deploy.s.sol --sig "deployUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
     function deployUpgrade() external {
-        uint256 deployerPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
 
         console.log("=== DEPLOY UPGRADE (contracts only, no propose) ===");
         console.log("Network:", _getNetworkName());
@@ -118,7 +118,7 @@ contract Deploy is Script {
     /// @notice Step 1: Deploy new impl + extension + propose upgrade (starts timelock)
     /// @dev forge script script/Deploy.s.sol --sig "proposeUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
     function proposeUpgrade() external {
-        uint256 adminPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        uint256 adminPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
         Config memory cfg = _getConfig();
 
         require(cfg.lendingPoolProxy != address(0), "No lending pool proxy configured");
@@ -149,7 +149,7 @@ contract Deploy is Script {
     /// @notice Step 2: Execute upgrade + set extension after timelock has elapsed
     /// @dev EXTENSION_ADDRESS=0x... forge script script/Deploy.s.sol --sig "executeUpgrade()" --rpc-url polygon_mainnet --broadcast
     function executeUpgrade() external {
-        uint256 adminPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        uint256 adminPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
         Config memory cfg = _getConfig();
 
         require(cfg.lendingPoolProxy != address(0), "No lending pool proxy configured");
@@ -182,7 +182,7 @@ contract Deploy is Script {
     /// @dev Initializes EIP-712 domain + sets relayer address (admin wallet = relayer)
     /// forge script script/Deploy.s.sol --sig "upgradeToV8()" --rpc-url polygon_mainnet --broadcast --verify
     function upgradeToV8() external {
-        uint256 adminPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
+        uint256 adminPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
         address adminAddr = vm.addr(adminPrivateKey);
         Config memory cfg = _getConfig();
 

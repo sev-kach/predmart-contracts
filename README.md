@@ -151,7 +151,7 @@ Deployments use the `deploy.sh` wrapper, which loads environment variables from 
 
 | Variable | Description |
 |---|---|
-| `ADMIN_WALLET_PRIVATE_KEY` | Deployer/admin wallet private key |
+| `RELAYER_PRIVATE_KEY` | Relayer/deployer wallet private key |
 | `POLYGONSCAN_API_KEY` | For automatic contract verification |
 | `POLYGON_MAINNET_RPC_URL` | Mainnet RPC endpoint |
 | `POLYGON_AMOY_RPC_URL` | Testnet RPC endpoint |
