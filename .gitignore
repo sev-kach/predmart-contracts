@@ -1,20 +1,27 @@
 # contracts/.gitignore
-cache/
-out/
-deploy_cache/
-foundry.toml.bak
-node_modules/
-broadcast/
+#
+# ALLOWLIST approach: ignore everything, then whitelist safe paths.
+# This prevents accidental commits of sensitive scripts, keys, or temp files.
+# To add a new file to the repo, explicitly add its path below.
 
-.DS_Store
+# Ignore everything by default
+*
 
-# Environment files
-.env
-.env.local
-.env.testnet
-.env.mainnet
+# === Allowed: repo config ===
+!.gitignore
+!.gitmodules
+!LICENSE
+!README.md
+!foundry.toml
+!foundry.lock
+!remappings.txt
 
-# Keep broadcast folder structure but ignore local chain and dry runs
-!/broadcast
-/broadcast/*/31337/
-/broadcast/**/dry-run/
+# === Allowed: source code ===
+!src/
+!src/**
+!script/
+!script/**
+!test/
+!test/**
+!lib/
+!lib/**

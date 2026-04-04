@@ -24,9 +24,7 @@ bracket_spacing = true
 wrap_comments = true
 
 [rpc_endpoints]
-polygon_amoy = "${POLYGON_AMOY_RPC_URL}"
 polygon_mainnet = "${POLYGON_MAINNET_RPC_URL}"
 
 [etherscan]
-polygon_amoy = { key = "${POLYGONSCAN_API_KEY}", url = "https://api-amoy.polygonscan.com/api" }
 polygon_mainnet = { key = "${POLYGONSCAN_API_KEY}", url = "https://api.polygonscan.com/api" }

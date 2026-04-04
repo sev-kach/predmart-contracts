@@ -8,6 +8,11 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { PredmartPoolLib } from "./PredmartPoolLib.sol";
 import { PredmartOracle } from "./PredmartOracle.sol";
 import { ICTF } from "./interfaces/ICTF.sol";
+import {
+    Position, MarketResolution, Redemption, PendingClose,
+    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer,
+    BadDebtAbsorbed, InterestAccrued, OperationFeeCollected, OperationFeeUpdated
+} from "./PredmartTypes.sol";
 
 /// @title PredmartPoolExtension
 /// @notice Admin and governance functions for PredmartLendingPool.
@@ -26,24 +31,23 @@ contract PredmartPoolExtension {
 
     uint256 public constant NUM_ANCHORS = 7;
     uint256 public constant MAX_RESOLUTION_AGE = 1 hours;
+    uint256 public constant MAX_OPERATION_FEE = 100_000; // $0.10 USDC maximum
 
     /*//////////////////////////////////////////////////////////////
                               ERRORS
     //////////////////////////////////////////////////////////////*/
 
-    error NotAdmin();
-    error InvalidAddress();
     error InvalidAnchors();
-    error TimelockNotReady();
-    error NoPendingChange();
     error TimelockCannotDecrease();
     error MarketAlreadyResolved();
     error MarketNotResolved();
-    error NoPosition();
     error TokenNotRedeemed();
     error AlreadyRedeemed();
     error RedemptionFailed();
     error UseRedemptionFlow();
+    error NoPendingClose();
+    error CloseNotExpired();
+    error FeeTooHigh();
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -68,35 +72,14 @@ contract PredmartPoolExtension {
     event AdminTransferCancelled();
     event MarketResolvedEvent(uint256 indexed tokenId, bool won);
     event PositionClosed(address indexed borrower, uint256 indexed tokenId, uint256 badDebt);
-    event BadDebtAbsorbed(address indexed borrower, uint256 indexed tokenId, uint256 amount);
-    event InterestAccrued(uint256 interest, uint256 reserve);
     event CollateralRedeemed(uint256 indexed tokenId, uint256 sharesRedeemed, uint256 usdcReceived);
     event RedemptionSettled(address indexed borrower, uint256 indexed tokenId, uint256 debtRepaid, uint256 surplusToUser);
-
-    /*//////////////////////////////////////////////////////////////
-                              STRUCTS
-    //////////////////////////////////////////////////////////////*/
-
-    struct Position {
-        uint256 collateralAmount;
-        uint256 borrowShares;
-        uint256 lastDepositTimestamp;
-        uint256 borrowedPrincipal;
-    }
-
-    struct MarketResolution {
-        bool resolved;
-        bool won;
-    }
-
-    struct Redemption {
-        bool redeemed;
-        uint256 totalShares;
-        uint256 usdcReceived;
-    }
+    event CloseSettled(address indexed borrower, uint256 indexed tokenId, uint256 repaid, uint256 badDebt, uint256 surplus);
+    event CloseExpired(address indexed borrower, uint256 indexed tokenId, uint256 badDebt);
 
     /*//////////////////////////////////////////////////////////////
               STATE — MUST MATCH PredmartLendingPool EXACTLY
+              (Shared structs imported from PredmartTypes.sol)
     //////////////////////////////////////////////////////////////*/
 
     // SLOT 0+
@@ -138,9 +121,19 @@ contract PredmartPoolExtension {
     mapping(address => uint256) public leverageNonces;
     mapping(bytes32 => uint256) public leverageBorrowUsed;
 
-    // v1.1.0 — Deleverage loop authorization
-    mapping(address => uint256) public deleverageNonces;
-    mapping(bytes32 => uint256) public deleverageWithdrawUsed;
+    // v1.1.0 — DEPRECATED (kept for proxy storage layout — no public getter)
+    mapping(address => uint256) internal deleverageNonces;
+    mapping(bytes32 => uint256) internal deleverageWithdrawUsed;
+
+    // v1.2.0 — Pool-funded flash close (must match PredmartLendingPool)
+    mapping(address => uint256) public closeNonces;
+    uint256 public totalPendingCloses;
+    mapping(address => mapping(uint256 => PendingClose)) public pendingCloses;
+
+    // v1.3.0 — Operation fee (must match PredmartLendingPool storage layout)
+    uint256 public operationFee;
+    uint256 public operationFeePool;
+    mapping(uint256 => uint256) public feeSharesAccumulated;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -200,6 +193,45 @@ contract PredmartPoolExtension {
     function setPoolCapBps(uint256 newCapBps) external onlyAdmin {
         poolCapBps = newCapBps;
         emit PoolCapUpdated(newCapBps);
+    }
+
+    /// @notice Set the operation fee for relayed transactions (instant, no timelock)
+    /// @param newFee Fee in USDC (6 decimals). E.g. 30000 = $0.03
+    function setOperationFee(uint256 newFee) external onlyAdmin {
+        if (newFee > MAX_OPERATION_FEE) revert FeeTooHigh();
+        operationFee = newFee;
+        emit OperationFeeUpdated(newFee);
+    }
+
+    /// @notice Withdraw accumulated USDC operation fees (for relayer gas top-up)
+    function withdrawOperationFees(uint256 amount) external onlyAdmin {
+        if (amount > operationFeePool) amount = operationFeePool;
+        operationFeePool -= amount;
+        IERC20(_asset()).safeTransfer(admin, amount);
+    }
+
+    /// @notice Withdraw accumulated CTF fee shares (for CLOB sale → relayer gas)
+    function withdrawFeeShares(uint256 tokenId, uint256 amount, address to) external onlyAdmin {
+        if (amount > feeSharesAccumulated[tokenId]) amount = feeSharesAccumulated[tokenId];
+        feeSharesAccumulated[tokenId] -= amount;
+        ICTF(ctf).safeTransferFrom(address(this), to, tokenId, amount, "");
+    }
+
+    /// @notice Sweep orphaned USDC from fee shares that were redeemed during market resolution.
+    ///         When fee shares are still in the contract at redemption time, they get redeemed
+    ///         with user collateral but no borrower can claim the pro-rata USDC. This moves
+    ///         that orphaned USDC from unsettledRedemptions into operationFeePool.
+    function sweepRedeemedFeeShares(uint256 tokenId) external onlyAdmin {
+        Redemption storage r = redeemedTokens[tokenId];
+        if (!r.redeemed) revert TokenNotRedeemed();
+        uint256 feeShares = feeSharesAccumulated[tokenId];
+        if (feeShares == 0) return;
+
+        uint256 orphaned = feeShares.mulDiv(r.usdcReceived, r.totalShares, Math.Rounding.Floor);
+        if (orphaned > unsettledRedemptions) orphaned = unsettledRedemptions;
+        unsettledRedemptions -= orphaned;
+        operationFeePool += orphaned;
+        feeSharesAccumulated[tokenId] = 0;
     }
 
     /// @notice Activate or increase the timelock delay (one-way ratchet)
@@ -293,9 +325,10 @@ contract PredmartPoolExtension {
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
         if (elapsed == 0) return;
 
-        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets;
+        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses;
         totalLiquidity = totalLiquidity > totalReserves ? totalLiquidity - totalReserves : 0;
         totalLiquidity = totalLiquidity > unsettledRedemptions ? totalLiquidity - unsettledRedemptions : 0;
+        totalLiquidity = totalLiquidity > operationFeePool ? totalLiquidity - operationFeePool : 0;
         uint256 utilization = totalLiquidity == 0 ? 0 : totalBorrowAssets.mulDiv(1e18, totalLiquidity);
 
         (uint256 interest, uint256 reserveShare) = PredmartPoolLib.calcPendingInterest(
@@ -350,7 +383,7 @@ contract PredmartPoolExtension {
     }
 
     /// @notice Close a position in a resolved market. Permissionless.
-    function closeResolvedPosition(address borrower, uint256 tokenId) external {
+    function closeLostPosition(address borrower, uint256 tokenId) external {
         MarketResolution memory resolution = resolvedMarkets[tokenId];
         if (!resolution.resolved) revert MarketNotResolved();
 
@@ -359,20 +392,18 @@ contract PredmartPoolExtension {
         Position storage pos = positions[borrower][tokenId];
         if (pos.collateralAmount == 0) revert NoPosition();
 
-        if (resolution.won) {
-            revert UseRedemptionFlow();
-        } else {
-            uint256 badDebt = pos.borrowShares > 0
-                ? _toBorrowAssetsInline(pos.borrowShares)
-                : 0;
-            if (pos.borrowShares > 0) {
-                _reduceBorrowTrackingInline(tokenId, badDebt, pos.borrowShares,
-                    pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : badDebt);
-            }
-            delete positions[borrower][tokenId];
-            if (badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, badDebt);
-            emit PositionClosed(borrower, tokenId, badDebt);
+        if (resolution.won) revert UseRedemptionFlow();
+
+        uint256 badDebt = pos.borrowShares > 0
+            ? _toBorrowAssetsInline(pos.borrowShares)
+            : 0;
+        if (pos.borrowShares > 0) {
+            _reduceBorrowTrackingInline(tokenId, badDebt, pos.borrowShares,
+                pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : badDebt);
         }
+        delete positions[borrower][tokenId];
+        if (badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, badDebt);
+        emit PositionClosed(borrower, tokenId, badDebt);
     }
 
     /// @notice Redeem winning CTF shares for USDC. Permissionless.
@@ -433,5 +464,81 @@ contract PredmartPoolExtension {
         }
 
         emit RedemptionSettled(borrower, tokenId, debt, surplus);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                   POOL-FUNDED FLASH CLOSE — SETTLEMENT
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Settle a pending flash close after the relayer sold shares on CLOB.
+    /// @dev Only callable by relayer. The relayer is trusted to report honest saleProceeds —
+    ///      under-reporting would steal user surplus. Relayer rotation is timelocked (6h).
+    ///      Follows checks-effects-interactions: state changes before external transfers.
+    /// @param borrower The position owner
+    /// @param tokenId The token ID of the closed position
+    /// @param saleProceeds USDC received from CLOB sale (6 decimals)
+    function settleClose(address borrower, uint256 tokenId, uint256 saleProceeds) external {
+        if (msg.sender != relayer) revert NotRelayer();
+
+        PendingClose storage pending = pendingCloses[borrower][tokenId];
+        if (pending.deadline == 0) revert NoPendingClose();
+
+        // ── Checks ──
+        uint256 debtAmount = pending.debtAmount;
+        address surplusRecipient = pending.surplusRecipient;
+
+        // Calculate surplus/badDebt BEFORE fee deduction (lender protection takes priority)
+        uint256 surplus = saleProceeds > debtAmount ? saleProceeds - debtAmount : 0;
+        uint256 badDebt = debtAmount > saleProceeds ? debtAmount - saleProceeds : 0;
+        uint256 repaid = saleProceeds > debtAmount ? debtAmount : saleProceeds;
+
+        // Operation fee is deducted from surplus only (user pays, not lenders)
+        // If surplus < fee, fee is waived to protect lenders from bad debt
+        uint256 feeCollected = 0;
+        if (operationFee > 0 && surplus >= operationFee) {
+            feeCollected = operationFee;
+            operationFeePool += feeCollected;
+            surplus -= feeCollected;
+            emit OperationFeeCollected(borrower, feeCollected);
+        }
+
+        // ── Effects ──
+        totalPendingCloses = totalPendingCloses > debtAmount ? totalPendingCloses - debtAmount : 0;
+        delete pendingCloses[borrower][tokenId];
+
+        emit CloseSettled(borrower, tokenId, repaid, badDebt, surplus);
+        if (badDebt > 0) {
+            emit BadDebtAbsorbed(borrower, tokenId, badDebt);
+        }
+
+        // ── Interactions ──
+        address asset_ = _asset();
+        if (saleProceeds > 0) {
+            IERC20(asset_).safeTransferFrom(msg.sender, address(this), saleProceeds);
+        }
+        if (surplus > 0) {
+            IERC20(asset_).safeTransfer(surplusRecipient, surplus);
+        }
+    }
+
+    /// @notice Expire a timed-out pending close. Permissionless — anyone can call after deadline.
+    /// @dev Full debt amount becomes bad debt, socialized to lenders.
+    /// @param borrower The position owner
+    /// @param tokenId The token ID of the closed position
+    function expirePendingClose(address borrower, uint256 tokenId) external {
+        PendingClose storage pending = pendingCloses[borrower][tokenId];
+        if (pending.deadline == 0) revert NoPendingClose();
+        if (block.timestamp < pending.deadline) revert CloseNotExpired();
+
+        uint256 badDebt = pending.debtAmount;
+
+        // Update accounting
+        totalPendingCloses = totalPendingCloses > badDebt ? totalPendingCloses - badDebt : 0;
+
+        // Clean up
+        delete pendingCloses[borrower][tokenId];
+
+        emit CloseExpired(borrower, tokenId, badDebt);
+        emit BadDebtAbsorbed(borrower, tokenId, badDebt);
     }
 }

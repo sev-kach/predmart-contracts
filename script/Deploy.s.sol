@@ -14,8 +14,6 @@ import { Script, console } from "forge-std/Script.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
-import { MockUSDC } from "../test/mocks/MockUSDC.sol";
-import { MockCTF } from "../test/mocks/MockCTF.sol";
 
 /// @title Deploy
 /// @notice Unified deployment script for Predmart contracts
@@ -40,13 +38,6 @@ contract Deploy is Script {
                 ctf: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045, // Polymarket CTF
                 lendingPoolProxy: 0xD90D012990F0245cAD29823bDF0B4C9AF207d9ee
             });
-        } else if (block.chainid == 80002) {
-            // Polygon Amoy (Testnet) — mock addresses set via env after deployMocks()
-            return Config({
-                usdc: vm.envOr("MOCK_USDC", address(0)),
-                ctf: vm.envOr("MOCK_CTF", address(0)),
-                lendingPoolProxy: 0xAFF720A9660A2384920C7A2b22e21883C3F58F8A
-            });
         } else {
             revert("Unsupported chain");
         }
@@ -55,7 +46,6 @@ contract Deploy is Script {
     /// @notice Get network name for logging
     function _getNetworkName() internal view returns (string memory) {
         if (block.chainid == 137) return "Polygon Mainnet";
-        if (block.chainid == 80002) return "Polygon Amoy";
         return "Unknown";
     }
 
@@ -64,7 +54,7 @@ contract Deploy is Script {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Fresh deployment: LendingPool implementation + proxy
-    /// @dev forge script script/Deploy.s.sol --sig "deployLendingPool()" --rpc-url polygon_amoy --broadcast --verify
+    /// @dev forge script script/Deploy.s.sol --sig "deployLendingPool()" --rpc-url polygon_mainnet --broadcast --verify
     function deployLendingPool() external {
         uint256 deployerPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
         address deployer = vm.addr(deployerPrivateKey);
@@ -99,44 +89,31 @@ contract Deploy is Script {
     }
 
     /*//////////////////////////////////////////////////////////////
-                    DEPLOY MOCK TOKENS (Testnet Only)
+                        UPGRADE LENDING POOL
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploy mock USDC and CTF contracts for testnet testing
-    /// @dev forge script script/Deploy.s.sol --sig "deployMocks()" --rpc-url polygon_amoy --broadcast
-    function deployMocks() external {
+    /// @notice Deploy new impl + extension only (no proposeAddress — use when admin is a Safe)
+    /// @dev forge script script/Deploy.s.sol --sig "deployUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
+    function deployUpgrade() external {
         uint256 deployerPrivateKey = vm.envUint("ADMIN_WALLET_PRIVATE_KEY");
-        address deployer = vm.addr(deployerPrivateKey);
 
-        require(block.chainid == 80002, "Mocks only on testnet");
-
-        console.log("=== DEPLOY MOCK TOKENS ===");
-        console.log("Deployer:", deployer);
+        console.log("=== DEPLOY UPGRADE (contracts only, no propose) ===");
+        console.log("Network:", _getNetworkName());
 
         vm.startBroadcast(deployerPrivateKey);
 
-        MockUSDC mockUsdc = new MockUSDC();
-        console.log("MockUSDC:", address(mockUsdc));
-
-        MockCTF mockCtf = new MockCTF();
-        console.log("MockCTF:", address(mockCtf));
-
-        // Mint 1M USDC to deployer for testing
-        mockUsdc.mint(deployer, 1_000_000e6);
-        console.log("Minted 1M USDC to deployer");
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        PredmartLendingPool newImpl = new PredmartLendingPool();
 
         vm.stopBroadcast();
 
+        console.log("New extension:", address(newExt));
+        console.log("New implementation:", address(newImpl));
         console.log("");
-        console.log("=== MOCKS DEPLOYED ===");
-        console.log("Set these in your env:");
-        console.log("MOCK_USDC=", address(mockUsdc));
-        console.log("MOCK_CTF=", address(mockCtf));
+        console.log("=== NEXT STEPS (via Gnosis Safe UI) ===");
+        console.log("1. proposeAddress(2, <new impl address>)  -- starts 6h timelock");
+        console.log("2. After 6h: upgradeToAndCall(<new impl>, setExtension(<new ext>))");
     }
-
-    /*//////////////////////////////////////////////////////////////
-                        UPGRADE LENDING POOL
-    //////////////////////////////////////////////////////////////*/
 
     /// @notice Step 1: Deploy new impl + extension + propose upgrade (starts timelock)
     /// @dev forge script script/Deploy.s.sol --sig "proposeUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
@@ -242,7 +219,7 @@ contract Deploy is Script {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Print addresses for manual verification
-    /// @dev forge script script/Deploy.s.sol --sig "showAddresses()" --rpc-url polygon_amoy
+    /// @dev forge script script/Deploy.s.sol --sig "showAddresses()" --rpc-url polygon_mainnet
     function showAddresses() external view {
         Config memory cfg = _getConfig();
 
