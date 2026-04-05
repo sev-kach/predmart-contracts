@@ -298,6 +298,11 @@ contract PredmartLendingPool is
         extension = _extension;
     }
 
+    /// @notice Initialize v1.4.0 — update extension (pullUsdcForLeverage added to extension)
+    function initializeV8(address _extension) public reinitializer(8) {
+        extension = _extension;
+    }
+
     /*//////////////////////////////////////////////////////////////
                         GLOBAL INTEREST ACCRUAL
     //////////////////////////////////////////////////////////////*/
@@ -1007,14 +1012,7 @@ contract PredmartLendingPool is
         emit ExtensionUpdated(ext);
     }
 
-    /// @notice Withdraw accumulated protocol reserves
-    function withdrawReserves(uint256 amount) external onlyAdmin {
-        _accrueInterest();
-        if (amount > totalReserves) amount = totalReserves;
-        totalReserves -= amount;
-        IERC20(asset()).safeTransfer(admin, amount);
-        emit ReservesWithdrawn(admin, amount);
-    }
+    // withdrawReserves moved to PredmartPoolExtension (EIP-170 size limit)
 
     /// @notice Get the current per-token borrow cap in USDC (6 decimals).
     function getTokenBorrowCap() external view returns (uint256) {

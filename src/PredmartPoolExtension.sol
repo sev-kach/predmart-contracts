@@ -3,6 +3,8 @@
 pragma solidity ^0.8.24;
 
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { PredmartPoolLib } from "./PredmartPoolLib.sol";
@@ -143,6 +145,13 @@ contract PredmartPoolExtension {
         if (msg.sender != admin) revert NotAdmin();
         _;
     }
+
+    // Errors for pullUsdcForLeverage (defined in main contract, redeclared here for the extension)
+    error BorrowTooSmall();
+    error IntentExpired();
+    error InvalidIntentSignature();
+    error InvalidNonce();
+    error ExceedsBorrowBudget();
 
     /*//////////////////////////////////////////////////////////////
                       ADMIN — INSTANT (safe operations)
@@ -540,5 +549,92 @@ contract PredmartPoolExtension {
 
         emit CloseExpired(borrower, tokenId, badDebt);
         emit BadDebtAbsorbed(borrower, tokenId, badDebt);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    ADMIN — RESERVES (moved from main for EIP-170)
+    //////////////////////////////////////////////////////////////*/
+
+    event ReservesWithdrawn(address indexed to, uint256 amount);
+
+    /// @notice Withdraw accumulated protocol reserves
+    function withdrawReserves(uint256 amount) external onlyAdmin {
+        _accrueInterestInline();
+        if (amount > totalReserves) amount = totalReserves;
+        totalReserves -= amount;
+        IERC20(_asset()).safeTransfer(admin, amount);
+        emit ReservesWithdrawn(admin, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                    LEVERAGE — USDC PULL FOR INITIAL BUY
+    //////////////////////////////////////////////////////////////*/
+
+    bytes32 private constant LEVERAGE_AUTH_TYPEHASH = keccak256(
+        "LeverageAuth(address borrower,address allowedFrom,uint256 tokenId,uint256 maxBorrow,uint256 nonce,uint256 deadline)"
+    );
+
+    struct LeverageAuth {
+        address borrower;
+        address allowedFrom;
+        uint256 tokenId;
+        uint256 maxBorrow;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    event UsdcPulledForLeverage(address indexed borrower, address indexed from, uint256 amount, uint256 indexed tokenId);
+
+    /// @notice Pull USDC from user's Safe to the relayer for the initial leverage buy.
+    /// @dev Lives in the extension (via delegatecall) to keep the main contract under EIP-170 size limit.
+    ///      Uses the same LeverageAuth + maxBorrow budget as leverageDeposit.
+    ///      TRUST MODEL: Same as leverageDeposit — relayer is trusted to buy shares
+    ///      and deposit them via leverageDeposit. Relayer rotation is timelocked (6h).
+    function pullUsdcForLeverage(
+        LeverageAuth calldata auth,
+        bytes calldata authSignature,
+        uint256 amount
+    ) external {
+        if (msg.sender != relayer) revert NotRelayer();
+        if (block.timestamp > auth.deadline) revert IntentExpired();
+        if (amount == 0) revert BorrowTooSmall();
+
+        bytes32 structHash = keccak256(abi.encode(
+            LEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedFrom, auth.tokenId,
+            auth.maxBorrow, auth.nonce, auth.deadline
+        ));
+        bytes32 authHash = _hashTypedDataV4Ext(structHash);
+        if (ECDSA.recover(authHash, authSignature) != auth.borrower) revert InvalidIntentSignature();
+
+        // Consume nonce on first use (same pattern as leverageDeposit)
+        bool isFirstUse = (leverageBorrowUsed[authHash] == 0);
+        if (isFirstUse) {
+            if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
+            leverageNonces[auth.borrower]++;
+        }
+
+        // Track against maxBorrow budget (shared limit for pulls + borrows)
+        uint256 newTotal = leverageBorrowUsed[authHash] + amount;
+        if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
+        leverageBorrowUsed[authHash] = newTotal;
+
+        // Pull USDC from user's Safe to relayer
+        IERC20(_asset()).safeTransferFrom(auth.allowedFrom, msg.sender, amount);
+
+        emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, amount, auth.tokenId);
+    }
+
+    /// @dev Compute EIP-712 typed data hash matching the main contract's _hashTypedDataV4.
+    ///      EIP712Upgradeable stores string name/version (not hashes) — we hardcode the hashes
+    ///      since they're set once during initializeV3 and never change.
+    function _hashTypedDataV4Ext(bytes32 structHash) internal view returns (bytes32) {
+        bytes32 domainSeparator = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256("Predmart Lending Pool"),
+            keccak256("0.8.0"),
+            block.chainid,
+            address(this)
+        ));
+        return MessageHashUtils.toTypedDataHash(domainSeparator, structHash);
     }
 }

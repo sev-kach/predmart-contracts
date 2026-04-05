@@ -837,7 +837,7 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 adminBalanceBefore = usdc.balanceOf(admin);
         vm.prank(admin);
-        pool.withdrawReserves(reserves);
+        poolAdmin.withdrawReserves(reserves);
 
         assertEq(usdc.balanceOf(admin), adminBalanceBefore + reserves);
         assertEq(pool.totalReserves(), 0);
