@@ -228,6 +228,11 @@ contract PredmartLendingPool is
     uint256 public operationFeePool; // Accumulated USDC fees dedicated to relayer gas top-up
     mapping(uint256 => uint256) public feeSharesAccumulated; // tokenId => CTF shares collected as withdrawal fees
 
+    // v1.5.0 — Single-step leverage: pool advances borrow USDC to relayer before collateral is deposited
+    mapping(bytes32 => uint256) public pendingAdvances; // authHash => USDC advanced to relayer
+    uint256 public totalPendingAdvances; // Global sum for liquidity monitoring
+    uint256 private _advanceOffset; // Transient: used to pass advance offset to _executeBorrow
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -288,18 +293,10 @@ contract PredmartLendingPool is
 
     /// @notice Initialize v1.0.0 — set extension address during UUPS upgrade
     /// @param _extension New extension contract address
-    function initializeV5(address _extension) public reinitializer(5) {
-        extension = _extension;
-    }
+    // initializeV5, V7, V8 removed — already executed, reinitializer prevents reuse
 
-    /// @notice Initialize v1.3.0 — set operation fee + update extension
-    function initializeV7(uint256 _operationFee, address _extension) public reinitializer(7) {
-        operationFee = _operationFee;
-        extension = _extension;
-    }
-
-    /// @notice Initialize v1.4.0 — update extension (pullUsdcForLeverage added to extension)
-    function initializeV8(address _extension) public reinitializer(8) {
+    /// @notice Initialize v1.5.0 — update extension (single-step leverage with pool advance)
+    function initializeV9(address _extension) public reinitializer(9) {
         extension = _extension;
     }
 
@@ -381,19 +378,20 @@ contract PredmartLendingPool is
     /// @dev Raw total assets without pending interest — used by getUtilization/getBorrowRate
     ///      to avoid circular dependency (_pendingInterest → getBorrowRate → getUtilization → totalAssets).
     function _totalAssetsStale() internal view returns (uint256) {
-        uint256 total = IERC20(asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses;
+        uint256 total = IERC20(asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances;
         total = total > totalReserves ? total - totalReserves : 0;
         total = total > unsettledRedemptions ? total - unsettledRedemptions : 0;
         total = total > operationFeePool ? total - operationFeePool : 0;
         return total;
     }
 
-    /// @dev Available USDC in the contract excluding reserves, unsettled redemptions, and operation fees
+    /// @dev Available USDC in the contract excluding reserves, unsettled redemptions, operation fees, and pending advances
     function _availableCash() internal view returns (uint256) {
         uint256 cash = IERC20(asset()).balanceOf(address(this));
         cash = cash > totalReserves ? cash - totalReserves : 0;
         cash = cash > unsettledRedemptions ? cash - unsettledRedemptions : 0;
         cash = cash > operationFeePool ? cash - operationFeePool : 0;
+        cash = cash > totalPendingAdvances ? cash - totalPendingAdvances : 0;
         return cash;
     }
 
@@ -670,14 +668,27 @@ contract PredmartLendingPool is
                 leverageNonces[auth.borrower]++;
             }
 
-            // Enforce cumulative borrow budget
-            uint256 newTotal = leverageBorrowUsed[authHash] + borrowAmount;
+            // Settle pending advance (v1.5.0): advance was already counted in
+            // leverageBorrowUsed by pullUsdcForLeverage, so only count the excess.
+            uint256 advance = pendingAdvances[authHash];
+            if (advance > 0) {
+                uint256 settled = advance > borrowAmount ? borrowAmount : advance;
+                pendingAdvances[authHash] = advance - settled;
+                totalPendingAdvances -= settled;
+                _advanceOffset = settled;
+            }
+
+            // Enforce cumulative borrow budget (advance portion already counted)
+            uint256 effectiveNewBorrow = borrowAmount > advance ? borrowAmount - advance : 0;
+            uint256 newTotal = leverageBorrowUsed[authHash] + effectiveNewBorrow;
             if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
             leverageBorrowUsed[authHash] = newTotal;
 
             if (priceData.tokenId != auth.tokenId) revert PredmartOracle.TokenIdMismatch();
             uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
             _executeBorrow(auth.borrower, auth.tokenId, borrowAmount, price, priceData.maxBorrow, borrowTo, isFirstBorrow);
+
+            _advanceOffset = 0;
         }
     }
 
@@ -702,6 +713,7 @@ contract PredmartLendingPool is
     ) external nonReentrant whenNotPaused {
         if (auth.allowedTo == address(0)) revert InvalidAddress();
         if (msg.sender != relayer) revert NotRelayer();
+        if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
         if (block.timestamp > auth.deadline) revert IntentExpired();
         if (auth.nonce != closeNonces[auth.borrower]) revert InvalidNonce();
 
@@ -792,8 +804,10 @@ contract PredmartLendingPool is
         // Depth-gate cap
         if (totalBorrowedPerToken[tokenId] + amount > maxBorrowDepthCap) revert DepthCapExceeded();
 
-        // Check liquidity
-        if (amount > _availableCash()) revert InsufficientLiquidity();
+        // Check liquidity (offset by advance already sent to relayer)
+        uint256 offset = _advanceOffset;
+        if (offset > amount) offset = amount; // Defensive: prevent underflow
+        if (amount - offset > _availableCash()) revert InsufficientLiquidity();
 
         // Convert amount to borrow shares (round UP)
         uint256 shares = _toBorrowShares(amount, Math.Rounding.Ceil);
@@ -805,13 +819,18 @@ contract PredmartLendingPool is
         totalBorrowShares += shares;
         totalBorrowedPerToken[tokenId] += amount;
 
-        // Transfer USDC (deduct operation fee when applicable)
-        uint256 fee = chargeFee ? operationFee : 0;
+        // Transfer USDC (deduct operation fee + advance offset).
+        // When offset > 0, fee was already charged in pullUsdcForLeverage — skip here.
+        uint256 fee = (chargeFee && offset == 0) ? operationFee : 0;
         if (fee > 0) {
             operationFeePool += fee;
             emit OperationFeeCollected(borrower, fee);
         }
-        IERC20(asset()).safeTransfer(sendTo, amount - fee);
+        uint256 deductions = fee + offset;
+        uint256 toSend = amount > deductions ? amount - deductions : 0;
+        if (toSend > 0) {
+            IERC20(asset()).safeTransfer(sendTo, toSend);
+        }
 
         emit Borrowed(borrower, tokenId, amount);
     }

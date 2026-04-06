@@ -48,8 +48,12 @@ contract PredmartPoolExtension {
     error RedemptionFailed();
     error UseRedemptionFlow();
     error NoPendingClose();
+    error InsufficientLiquidity();
+    error NoPendingAdvance();
     error CloseNotExpired();
     error FeeTooHigh();
+    error MarketResolved();
+    error AdvanceTooSmall();
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -136,6 +140,11 @@ contract PredmartPoolExtension {
     uint256 public operationFee;
     uint256 public operationFeePool;
     mapping(uint256 => uint256) public feeSharesAccumulated;
+
+    // v1.5.0 — Single-step leverage (must match PredmartLendingPool storage layout)
+    mapping(bytes32 => uint256) public pendingAdvances;
+    uint256 public totalPendingAdvances;
+    uint256 private _advanceOffset;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -334,7 +343,7 @@ contract PredmartPoolExtension {
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
         if (elapsed == 0) return;
 
-        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses;
+        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances;
         totalLiquidity = totalLiquidity > totalReserves ? totalLiquidity - totalReserves : 0;
         totalLiquidity = totalLiquidity > unsettledRedemptions ? totalLiquidity - unsettledRedemptions : 0;
         totalLiquidity = totalLiquidity > operationFeePool ? totalLiquidity - operationFeePool : 0;
@@ -552,6 +561,24 @@ contract PredmartPoolExtension {
     }
 
     /*//////////////////////////////////////////////////////////////
+                    ADMIN — ADVANCE RECOVERY
+    //////////////////////////////////////////////////////////////*/
+
+    event AdvanceExpired(bytes32 indexed authHash, uint256 amount);
+
+    /// @notice Clear a stuck pending advance after admin recovery of USDC from relayer.
+    /// @dev Admin-only. Use when the relayer received an advance but never called leverageDeposit.
+    ///      The admin must first recover the USDC from the relayer wallet (manual transfer),
+    ///      then call this to clear the on-chain accounting.
+    function expireAdvance(bytes32 authHash) external onlyAdmin {
+        uint256 amount = pendingAdvances[authHash];
+        if (amount == 0) revert NoPendingAdvance();
+        pendingAdvances[authHash] = 0;
+        totalPendingAdvances -= amount;
+        emit AdvanceExpired(authHash, amount);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                     ADMIN — RESERVES (moved from main for EIP-170)
     //////////////////////////////////////////////////////////////*/
 
@@ -584,20 +611,29 @@ contract PredmartPoolExtension {
     }
 
     event UsdcPulledForLeverage(address indexed borrower, address indexed from, uint256 amount, uint256 indexed tokenId);
+    event PoolAdvancedForLeverage(address indexed borrower, uint256 advanceAmount, uint256 indexed tokenId);
 
-    /// @notice Pull USDC from user's Safe to the relayer for the initial leverage buy.
+    /// @notice Pull USDC from user's Safe + optionally advance borrow USDC from pool to relayer.
     /// @dev Lives in the extension (via delegatecall) to keep the main contract under EIP-170 size limit.
     ///      Uses the same LeverageAuth + maxBorrow budget as leverageDeposit.
+    ///      The advance is unsecured pool USDC sent to the relayer before collateral is deposited.
+    ///      It is formalized as a real borrow when leverageDeposit is called (advance offset pattern).
     ///      TRUST MODEL: Same as leverageDeposit — relayer is trusted to buy shares
     ///      and deposit them via leverageDeposit. Relayer rotation is timelocked (6h).
+    /// @param auth The user's leverage authorization
+    /// @param authSignature The user's EIP-712 signature
+    /// @param userAmount USDC to pull from user's Safe to relayer
+    /// @param advanceAmount USDC to advance from pool to relayer (formalized as borrow in leverageDeposit)
     function pullUsdcForLeverage(
         LeverageAuth calldata auth,
         bytes calldata authSignature,
-        uint256 amount
+        uint256 userAmount,
+        uint256 advanceAmount
     ) external {
         if (msg.sender != relayer) revert NotRelayer();
+        if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
         if (block.timestamp > auth.deadline) revert IntentExpired();
-        if (amount == 0) revert BorrowTooSmall();
+        if (userAmount == 0 && advanceAmount == 0) revert BorrowTooSmall();
 
         bytes32 structHash = keccak256(abi.encode(
             LEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedFrom, auth.tokenId,
@@ -613,15 +649,40 @@ contract PredmartPoolExtension {
             leverageNonces[auth.borrower]++;
         }
 
-        // Track against maxBorrow budget (shared limit for pulls + borrows)
-        uint256 newTotal = leverageBorrowUsed[authHash] + amount;
+        // Track BOTH user pull + advance against maxBorrow budget
+        uint256 newTotal = leverageBorrowUsed[authHash] + userAmount + advanceAmount;
         if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
         leverageBorrowUsed[authHash] = newTotal;
 
         // Pull USDC from user's Safe to relayer
-        IERC20(_asset()).safeTransferFrom(auth.allowedFrom, msg.sender, amount);
+        if (userAmount > 0) {
+            IERC20(_asset()).safeTransferFrom(auth.allowedFrom, msg.sender, userAmount);
+            emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, userAmount, auth.tokenId);
+        }
 
-        emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, amount, auth.tokenId);
+        // Advance pool USDC to relayer (formalized as borrow in leverageDeposit)
+        if (advanceAmount > 0) {
+            // Collect operation fee from the advance (spam protection).
+            // Fee is charged here (not in _executeBorrow) because the USDC leaves the pool here.
+            uint256 fee = operationFee;
+            if (advanceAmount <= fee) revert AdvanceTooSmall();
+            uint256 netAdvance = advanceAmount - fee;
+            operationFeePool += fee;
+            emit OperationFeeCollected(auth.borrower, fee);
+
+            // Liquidity check (inline — extension can't call _availableCash)
+            uint256 cash = IERC20(_asset()).balanceOf(address(this));
+            if (cash > totalReserves) cash -= totalReserves; else cash = 0;
+            if (cash > unsettledRedemptions) cash -= unsettledRedemptions; else cash = 0;
+            if (cash > operationFeePool) cash -= operationFeePool; else cash = 0;
+            if (cash > totalPendingAdvances) cash -= totalPendingAdvances; else cash = 0;
+            if (netAdvance > cash) revert InsufficientLiquidity();
+
+            pendingAdvances[authHash] += netAdvance;
+            totalPendingAdvances += netAdvance;
+            IERC20(_asset()).safeTransfer(msg.sender, netAdvance);
+            emit PoolAdvancedForLeverage(auth.borrower, netAdvance, auth.tokenId);
+        }
     }
 
     /// @dev Compute EIP-712 typed data hash matching the main contract's _hashTypedDataV4.
