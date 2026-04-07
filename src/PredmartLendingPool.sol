@@ -218,8 +218,8 @@ contract PredmartLendingPool is
     mapping(address => uint256) internal deleverageNonces;
     mapping(bytes32 => uint256) internal deleverageWithdrawUsed;
 
-    // v1.2.0 — Pool-funded flash close
-    mapping(address => uint256) public closeNonces; // Separate nonce for flash close
+    // v1.2.0 — Pool-funded flash close (v1.6.0: changed to per-position nonces for TP/SL support)
+    mapping(address => mapping(uint256 => uint256)) public closeNonces; // borrower => tokenId => nonce
     uint256 public totalPendingCloses; // Sum of all pending close debt amounts (USDC 6 decimal)
     mapping(address => mapping(uint256 => PendingClose)) public pendingCloses; // borrower => tokenId => pending
 
@@ -293,10 +293,10 @@ contract PredmartLendingPool is
 
     /// @notice Initialize v1.0.0 — set extension address during UUPS upgrade
     /// @param _extension New extension contract address
-    // initializeV5, V7, V8 removed — already executed, reinitializer prevents reuse
+    // initializeV5, V7, V8, V9 removed — already executed, reinitializer prevents reuse
 
-    /// @notice Initialize v1.5.0 — update extension (single-step leverage with pool advance)
-    function initializeV9(address _extension) public reinitializer(9) {
+    /// @notice Initialize v1.6.0 — update extension (per-position close nonces for TP/SL)
+    function initializeV10(address _extension) public reinitializer(10) {
         extension = _extension;
     }
 
@@ -715,7 +715,7 @@ contract PredmartLendingPool is
         if (msg.sender != relayer) revert NotRelayer();
         if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
         if (block.timestamp > auth.deadline) revert IntentExpired();
-        if (auth.nonce != closeNonces[auth.borrower]) revert InvalidNonce();
+        if (auth.nonce != closeNonces[auth.borrower][auth.tokenId]) revert InvalidNonce();
 
         // Verify EIP-712 signature
         bytes32 structHash = keccak256(abi.encode(
@@ -725,7 +725,7 @@ contract PredmartLendingPool is
         if (signer != auth.borrower) revert InvalidIntentSignature();
 
         // Consume nonce
-        closeNonces[auth.borrower]++;
+        closeNonces[auth.borrower][auth.tokenId]++;
 
         // Block double close
         if (pendingCloses[auth.borrower][auth.tokenId].deadline != 0) revert PositionHasPendingClose();

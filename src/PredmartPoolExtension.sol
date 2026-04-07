@@ -131,8 +131,8 @@ contract PredmartPoolExtension {
     mapping(address => uint256) internal deleverageNonces;
     mapping(bytes32 => uint256) internal deleverageWithdrawUsed;
 
-    // v1.2.0 — Pool-funded flash close (must match PredmartLendingPool)
-    mapping(address => uint256) public closeNonces;
+    // v1.2.0 — Pool-funded flash close (v1.6.0: per-position nonces, must match PredmartLendingPool)
+    mapping(address => mapping(uint256 => uint256)) public closeNonces;
     uint256 public totalPendingCloses;
     mapping(address => mapping(uint256 => PendingClose)) public pendingCloses;
 

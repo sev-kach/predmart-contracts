@@ -2384,7 +2384,7 @@ contract PredmartLendingPoolTest is Test {
         bytes memory sig,
         PredmartOracle.PriceData memory priceData
     ) {
-        uint256 nonce = pool.closeNonces(borrower);
+        uint256 nonce = pool.closeNonces(borrower, tokenId);
         uint256 deadline = block.timestamp + 300;
         auth = PredmartLendingPool.CloseAuth({
             borrower: borrower,
@@ -2434,7 +2434,7 @@ contract PredmartLendingPoolTest is Test {
         assertApproxEqAbs(pool.totalAssets(), totalAssetsBefore, 1, "totalAssets invariant");
 
         // Nonce consumed
-        assertEq(pool.closeNonces(borrower), 1, "Nonce should be 1");
+        assertEq(pool.closeNonces(borrower, TOKEN_ID_YES), 1, "Nonce should be 1");
     }
 
     function test_flashClose_settleFullRepayment() public {
@@ -2600,7 +2600,7 @@ contract PredmartLendingPoolTest is Test {
         vm.stopPrank();
 
         // Flash close on zero-debt position should revert (use withdrawViaRelay instead)
-        uint256 nonce = pool.closeNonces(borrower);
+        uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
         PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
             borrower: borrower,
@@ -2620,7 +2620,7 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
-        uint256 nonce = pool.closeNonces(borrower);
+        uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
         PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
             borrower: borrower,
@@ -2642,7 +2642,7 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
-        uint256 nonce = pool.closeNonces(borrower);
+        uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
         PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
             borrower: borrower,
