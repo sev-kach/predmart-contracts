@@ -612,14 +612,16 @@ contract PredmartLendingPool is
         _executeBorrow(intent.borrower, intent.tokenId, intent.amount, price, priceData.maxBorrow, intent.borrower, true);
     }
 
-    /// @notice Execute one step of a leverage loop: deposit collateral + borrow USDC.
+    /// @notice Execute one step of a leverage operation: deposit collateral + borrow USDC.
     /// @dev Only callable by the relayer. User must sign a LeverageAuth EIP-712 message authorizing
     ///      a maximum borrow budget. The contract verifies the signature and tracks cumulative borrowing
     ///      against the budget. The auth is consumed (nonce incremented) on first use and expires at deadline.
-    ///      Borrowed USDC goes to auth.allowedFrom (user's Safe) so the user can buy shares on the CLOB.
+    ///      Used in both single-step leverage (after pullUsdcForLeverage) and multi-step loops.
+    ///      In single-step: called once to deposit all shares + formalize the pool advance as debt.
+    ///      In multi-step: called iteratively (deposit → borrow → CLOB buy → deposit → borrow → ...).
     ///
     ///      NONCE DESIGN (LC-02): Nonce is consumed on first borrow, NOT on deposit-only calls.
-    ///      This is intentional. A leverage loop is multi-step (deposit → borrow → deposit → borrow).
+    ///      This is intentional. In a multi-step loop (deposit → borrow → deposit → borrow),
     ///      If the nonce were consumed on the first deposit-only step, the auth (signed with nonce N)
     ///      would be bricked — subsequent steps would fail because the contract expects nonce N+1.
     ///      Deposit-only replay is harmless: it only adds collateral (improving the borrower's HF).
