@@ -555,7 +555,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Relayer calls liquidate (USDC comes from relayer)
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, lowPrice);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, lowPrice);
 
         // Position should be deleted
         (uint256 collateral, uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -576,7 +576,7 @@ contract PredmartLendingPoolTest is Test {
         // Price stays at $0.80 — position is healthy
         vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.PositionHealthy.selector);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_Liquidate_RevertsNotRelayer() public {
@@ -587,7 +587,7 @@ contract PredmartLendingPoolTest is Test {
         vm.startPrank(liquidator);
         usdc.approve(address(pool), type(uint256).max);
         vm.expectRevert(NotRelayer.selector);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
         vm.stopPrank();
     }
 
@@ -918,7 +918,7 @@ contract PredmartLendingPoolTest is Test {
         // Liquidation blocked during pause (protects against compromised oracle)
         vm.expectRevert(PredmartLendingPool.ProtocolPaused.selector);
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
     }
 
     function test_Unpause() public {
@@ -989,7 +989,7 @@ contract PredmartLendingPoolTest is Test {
         // YES price drops — position becomes unhealthy
         // NO price stays high — position is fine
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
 
         // YES position liquidated
         (uint256 collYes,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -1119,7 +1119,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Price drops → liquidate (via relayer)
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
 
         // Tracked amount should decrease
         assertLt(pool.totalBorrowedPerToken(TOKEN_ID_YES), trackedBefore);
@@ -1929,7 +1929,7 @@ contract PredmartLendingPoolTest is Test {
         uint256 totalAssetsBefore = pool.totalAssets();
 
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, crashPrice);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, crashPrice);
 
         // Position fully deleted
         (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -2263,7 +2263,7 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 collBefore = 10_000e6;
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, 2_000e6, lowPrice); // Partial repay: 2000 USDC
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, 2_000e6, lowPrice); // Partial repay: 2000 USDC
 
         (uint256 collAfter, uint256 sharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
         // Position should still exist (partial liquidation)
@@ -2984,7 +2984,7 @@ contract PredmartLendingPoolTest is Test {
         // Price drops → position unhealthy
         uint256 feePoolBefore = pool.operationFeePool();
         vm.prank(relayer);
-        pool.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
 
         // No fee charged for liquidation
         assertEq(pool.operationFeePool(), feePoolBefore, "Liquidation should not charge fee");

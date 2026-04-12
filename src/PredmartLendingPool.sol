@@ -40,7 +40,7 @@ contract PredmartLendingPool is
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    string public constant VERSION = "1.3.0";
+    string public constant VERSION = "1.7.0";
 
     uint256 public constant MAX_RELAY_PRICE_AGE = 10 seconds;
     uint256 public constant NUM_ANCHORS = 7;
@@ -233,6 +233,9 @@ contract PredmartLendingPool is
     uint256 public totalPendingAdvances; // Global sum for liquidity monitoring
     uint256 private _advanceOffset; // Transient: used to pass advance offset to _executeBorrow
 
+    // v1.7.0 — NegRisk support: adapter for redeeming neg_risk CTF positions
+    address public negRiskAdapter;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -285,19 +288,17 @@ contract PredmartLendingPool is
     }
 
     /// @notice Initialize v0.8.0 — EIP-712 domain + relayer for meta-transactions
-    /// @param _relayer Trusted relayer address (backend's transaction sender)
     function initializeV4(address _relayer) public reinitializer(4) {
         __EIP712_init("Predmart Lending Pool", "0.8.0");
         relayer = _relayer;
     }
 
-    /// @notice Initialize v1.0.0 — set extension address during UUPS upgrade
-    /// @param _extension New extension contract address
-    // initializeV5, V7, V8, V9 removed — already executed, reinitializer prevents reuse
+    // initializeV5, V7, V8, V9, V10 removed — already executed, reinitializer prevents reuse
 
-    /// @notice Initialize v1.6.0 — update extension (per-position close nonces for TP/SL)
-    function initializeV10(address _extension) public reinitializer(10) {
+    /// @notice Initialize v1.7.0 — update extension + set NegRiskAdapter for neg_risk redemption
+    function initializeV11(address _extension, address _negRiskAdapter) public reinitializer(11) {
         extension = _extension;
+        negRiskAdapter = _negRiskAdapter;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -887,78 +888,7 @@ contract PredmartLendingPool is
     /// @param borrower Address of the borrower to liquidate
     /// @param tokenId Token ID of the position to liquidate
     /// @param repayAmount Maximum USDC the liquidator is willing to repay (ignored for underwater)
-    /// @param priceData Signed price data from oracle
-    function liquidate(
-        address borrower,
-        uint256 tokenId,
-        uint256 repayAmount,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant whenNotPaused {
-        if (msg.sender != relayer) revert NotRelayer();
-        // Block liquidation on lost markets (shares worth $0 — liquidator would get worthless collateral).
-        // Won markets stay liquidatable — ensures lenders can always recover debt.
-        MarketResolution memory resolution = resolvedMarkets[tokenId];
-        if (resolution.resolved && !resolution.won) revert MarketResolved();
-        if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
-        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-
-        _accrueInterest();
-
-        Position storage pos = positions[borrower][tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-
-        // Check position is unhealthy (health factor < 1.0)
-        uint256 debt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-        uint256 healthFactor = _getHealthFactor(pos.collateralAmount, debt, price);
-        if (healthFactor >= 1e18) revert PositionHealthy();
-
-        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
-            pos.collateralAmount, debt, healthFactor, price, repayAmount
-        );
-
-        // Determine borrow shares to burn
-        uint256 sharesToBurn;
-        if (vars.repayAmount >= debt) {
-            sharesToBurn = pos.borrowShares;
-            vars.repayAmount = debt;
-        } else {
-            sharesToBurn = _toBorrowShares(vars.repayAmount, Math.Rounding.Floor);
-        }
-
-        uint256 pr = pos.borrowedPrincipal == 0 ? vars.repayAmount
-            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
-            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
-        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
-
-        IERC20(asset()).safeTransferFrom(msg.sender, address(this), vars.liquidatorCost);
-
-        pos.borrowShares -= sharesToBurn;
-        pos.collateralAmount -= vars.seizeCollateral;
-        _reduceBorrowTracking(tokenId, vars.repayAmount, sharesToBurn, pr);
-
-        // Residual bad debt: collateral gone but debt remains
-        if (pos.collateralAmount == 0 && pos.borrowShares > 0) {
-            uint256 residualDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-            uint256 rp = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : residualDebt;
-            pos.borrowedPrincipal = 0;
-            _reduceBorrowTracking(tokenId, residualDebt, pos.borrowShares, rp);
-            vars.badDebt += residualDebt;
-            pos.borrowShares = 0;
-        }
-
-        // Clean up empty position
-        if (pos.collateralAmount == 0 && pos.borrowShares == 0) {
-            delete positions[borrower][tokenId];
-        }
-
-        // Transfer collateral to liquidator
-        ICTF(ctf).safeTransferFrom(address(this), msg.sender, tokenId, vars.seizeCollateral, "");
-
-        emit Liquidated(msg.sender, borrower, tokenId, vars.seizeCollateral, vars.liquidatorCost);
-        if (vars.badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, vars.badDebt);
-    }
-
-    // NOTE: resolveMarket, closeLostPosition, redeemWonCollateral, and settleRedemption
+    // NOTE: liquidate, resolveMarket, closeLostPosition, redeemWonCollateral, and settleRedemption
     // have been moved to PredmartPoolExtension to free main contract bytecode space.
     // They are accessible at the same address via the fallback() → delegatecall pattern.
 

@@ -10,6 +10,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
 import { PredmartPoolLib } from "./PredmartPoolLib.sol";
 import { PredmartOracle } from "./PredmartOracle.sol";
 import { ICTF } from "./interfaces/ICTF.sol";
+import { INegRiskAdapter } from "./interfaces/INegRiskAdapter.sol";
 import {
     Position, MarketResolution, Redemption, PendingClose,
     NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer,
@@ -54,6 +55,10 @@ contract PredmartPoolExtension {
     error FeeTooHigh();
     error MarketResolved();
     error AdvanceTooSmall();
+    error PositionHealthy();
+    error ProtocolPaused();
+
+    event Liquidated(address indexed liquidator, address indexed borrower, uint256 indexed tokenId, uint256 seizeCollateral, uint256 liquidatorCost);
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -145,6 +150,9 @@ contract PredmartPoolExtension {
     mapping(bytes32 => uint256) public pendingAdvances;
     uint256 public totalPendingAdvances;
     uint256 private _advanceOffset;
+
+    // v1.7.0 — NegRisk support
+    address public negRiskAdapter;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -375,6 +383,18 @@ contract PredmartPoolExtension {
             ? totalBorrowedPerToken[tokenId] - principalReduction : 0;
     }
 
+    /// @dev Inline borrow assets → shares conversion (must match PredmartLendingPool._toBorrowShares).
+    function _toBorrowSharesInline(uint256 assets, Math.Rounding rounding) internal view returns (uint256) {
+        return assets.mulDiv(totalBorrowShares + 1e6, totalBorrowAssets + 1, rounding);
+    }
+
+    /// @dev Inline health factor calculation (must match PredmartLendingPool._getHealthFactor).
+    function _getHealthFactorInline(uint256 collateralAmount, uint256 debt, uint256 price) internal view returns (uint256) {
+        uint256 ltv = PredmartPoolLib.interpolate(priceAnchors, ltvAnchors, price);
+        uint256 liqThreshold = ltv + PredmartPoolLib.LIQUIDATION_BUFFER;
+        return PredmartPoolLib.calcHealthFactor(collateralAmount, debt, price, liqThreshold);
+    }
+
     /// @dev Get the ERC-4626 underlying asset address via the ERC-7201 namespaced storage slot.
     function _asset() internal view returns (address) {
         // ERC4626Upgradeable stores the asset in namespaced storage.
@@ -426,6 +446,16 @@ contract PredmartPoolExtension {
 
     /// @notice Redeem winning CTF shares for USDC. Permissionless.
     function redeemWonCollateral(uint256 tokenId, bytes32 conditionId, uint256 indexSet) external {
+        _redeemWonCollateral(tokenId, conditionId, indexSet, false);
+    }
+
+    /// @notice Redeem winning neg_risk CTF shares via NegRiskAdapter
+    /// @param outcomeIndex 0 for YES tokens, 1 for NO tokens
+    function redeemWonCollateralNegRisk(uint256 tokenId, bytes32 conditionId, uint256 outcomeIndex) external {
+        _redeemWonCollateral(tokenId, conditionId, outcomeIndex, true);
+    }
+
+    function _redeemWonCollateral(uint256 tokenId, bytes32 conditionId, uint256 indexSet, bool negRisk) internal {
         MarketResolution memory resolution = resolvedMarkets[tokenId];
         if (!resolution.resolved || !resolution.won) revert MarketNotResolved();
         if (redeemedTokens[tokenId].redeemed) revert AlreadyRedeemed();
@@ -434,9 +464,22 @@ contract PredmartPoolExtension {
         uint256 sharesBefore = ICTF(ctf).balanceOf(address(this), tokenId);
         uint256 usdcBefore = IERC20(asset_).balanceOf(address(this));
 
-        uint256[] memory indexSets = new uint256[](1);
-        indexSets[0] = indexSet;
-        ICTF(ctf).redeemPositions(asset_, bytes32(0), conditionId, indexSets);
+        if (negRisk) {
+            // NegRisk: approve adapter, then call adapter.redeemPositions
+            // amounts[] has 2 elements: [yes_amount, no_amount]. Only the winning side is non-zero.
+            if (negRiskAdapter == address(0)) revert InvalidAddress();
+            if (!ICTF(ctf).isApprovedForAll(address(this), negRiskAdapter)) {
+                ICTF(ctf).setApprovalForAll(negRiskAdapter, true);
+            }
+            uint256[] memory amounts = new uint256[](2);
+            amounts[indexSet] = sharesBefore; // indexSet = 0 for YES, 1 for NO
+            INegRiskAdapter(negRiskAdapter).redeemPositions(conditionId, amounts);
+        } else {
+            // Standard: call CTF.redeemPositions directly
+            uint256[] memory indexSets = new uint256[](1);
+            indexSets[0] = indexSet;
+            ICTF(ctf).redeemPositions(asset_, bytes32(0), conditionId, indexSets);
+        }
 
         uint256 sharesAfter = ICTF(ctf).balanceOf(address(this), tokenId);
         uint256 usdcAfter = IERC20(asset_).balanceOf(address(this));
@@ -482,6 +525,77 @@ contract PredmartPoolExtension {
         }
 
         emit RedemptionSettled(borrower, tokenId, debt, surplus);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                            LIQUIDATION
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Liquidate an unhealthy position. Relayer-only.
+    function liquidate(
+        address borrower,
+        uint256 tokenId,
+        uint256 repayAmount,
+        PredmartOracle.PriceData calldata priceData
+    ) external {
+        if (msg.sender != relayer) revert NotRelayer();
+        if (paused) revert ProtocolPaused();
+        // Block liquidation on lost markets (shares worth $0 — liquidator would get worthless collateral).
+        // Won markets stay liquidatable — ensures lenders can always recover debt.
+        MarketResolution memory resolution = resolvedMarkets[tokenId];
+        if (resolution.resolved && !resolution.won) revert MarketResolved();
+        if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
+        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), 10 seconds);
+
+        _accrueInterestInline();
+
+        Position storage pos = positions[borrower][tokenId];
+        if (pos.collateralAmount == 0) revert NoPosition();
+
+        uint256 debt = _toBorrowAssetsInline(pos.borrowShares);
+        uint256 healthFactor = _getHealthFactorInline(pos.collateralAmount, debt, price);
+        if (healthFactor >= 1e18) revert PositionHealthy();
+
+        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
+            pos.collateralAmount, debt, healthFactor, price, repayAmount
+        );
+
+        uint256 sharesToBurn;
+        if (vars.repayAmount >= debt) {
+            sharesToBurn = pos.borrowShares;
+            vars.repayAmount = debt;
+        } else {
+            sharesToBurn = _toBorrowSharesInline(vars.repayAmount, Math.Rounding.Floor);
+        }
+
+        uint256 pr = pos.borrowedPrincipal == 0 ? vars.repayAmount
+            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
+            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
+        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
+
+        IERC20(_asset()).safeTransferFrom(msg.sender, address(this), vars.liquidatorCost);
+
+        pos.borrowShares -= sharesToBurn;
+        pos.collateralAmount -= vars.seizeCollateral;
+        _reduceBorrowTrackingInline(tokenId, vars.repayAmount, sharesToBurn, pr);
+
+        if (pos.collateralAmount == 0 && pos.borrowShares > 0) {
+            uint256 residualDebt = _toBorrowAssetsInline(pos.borrowShares);
+            uint256 rp = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : residualDebt;
+            pos.borrowedPrincipal = 0;
+            _reduceBorrowTrackingInline(tokenId, residualDebt, pos.borrowShares, rp);
+            vars.badDebt += residualDebt;
+            pos.borrowShares = 0;
+        }
+
+        if (pos.collateralAmount == 0 && pos.borrowShares == 0) {
+            delete positions[borrower][tokenId];
+        }
+
+        ICTF(ctf).safeTransferFrom(address(this), msg.sender, tokenId, vars.seizeCollateral, "");
+
+        emit Liquidated(msg.sender, borrower, tokenId, vars.seizeCollateral, vars.liquidatorCost);
+        if (vars.badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, vars.badDebt);
     }
 
     /*//////////////////////////////////////////////////////////////

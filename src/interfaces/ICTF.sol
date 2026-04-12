@@ -12,6 +12,8 @@ interface ICTF {
 
     function isApprovedForAll(address owner, address operator) external view returns (bool);
 
+    function setApprovalForAll(address operator, bool approved) external;
+
     /// @notice Redeem resolved conditional tokens for collateral (USDC)
     /// @dev Burns all caller's tokens for the given condition and returns collateral for winning outcomes
     function redeemPositions(
