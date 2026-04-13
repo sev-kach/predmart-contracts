@@ -12,9 +12,9 @@ import { PredmartOracle } from "./PredmartOracle.sol";
 import { ICTF } from "./interfaces/ICTF.sol";
 import { INegRiskAdapter } from "./interfaces/INegRiskAdapter.sol";
 import {
-    Position, MarketResolution, Redemption, PendingClose,
-    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer,
-    BadDebtAbsorbed, InterestAccrued, OperationFeeCollected, OperationFeeUpdated
+    Position, MarketResolution, Redemption, PendingClose, PendingLiquidation,
+    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NoPendingLiquidation, NotLiquidator,
+    BadDebtAbsorbed, InterestAccrued, OperationFeeCollected, OperationFeeUpdated, LiquidationSettled, ProfitFeeCollected
 } from "./PredmartTypes.sol";
 
 /// @title PredmartPoolExtension
@@ -57,8 +57,9 @@ contract PredmartPoolExtension {
     error AdvanceTooSmall();
     error PositionHealthy();
     error ProtocolPaused();
+    error TooEarly();
 
-    event Liquidated(address indexed liquidator, address indexed borrower, uint256 indexed tokenId, uint256 seizeCollateral, uint256 liquidatorCost);
+    event Liquidated(address indexed liquidator, address indexed borrower, uint256 indexed tokenId, uint256 collateralSeized, uint256 debtAmount);
 
     /*//////////////////////////////////////////////////////////////
                               EVENTS
@@ -154,6 +155,16 @@ contract PredmartPoolExtension {
     // v1.7.0 — NegRisk support
     address public negRiskAdapter;
 
+    // v2.0.0 — Pending liquidations (seize-first model, must match PredmartLendingPool)
+    mapping(address => mapping(uint256 => PendingLiquidation)) public pendingLiquidations;
+    uint256 public totalPendingLiquidations;
+
+    // v2.0.0 — Protocol fee accumulator (3% of profit fees)
+    uint256 public protocolFeePool;
+
+    // v2.0.0 — Separate liquidator wallet (can call liquidate + settleLiquidation)
+    address public liquidator;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -221,6 +232,15 @@ contract PredmartPoolExtension {
         emit PoolCapUpdated(newCapBps);
     }
 
+    event LiquidatorUpdated(address indexed newLiquidator);
+
+    /// @notice Set the dedicated liquidator wallet address (instant, no timelock)
+    function setLiquidator(address _liquidator) external onlyAdmin {
+        if (_liquidator == address(0)) revert InvalidAddress();
+        liquidator = _liquidator;
+        emit LiquidatorUpdated(_liquidator);
+    }
+
     /// @notice Set the operation fee for relayed transactions (instant, no timelock)
     /// @param newFee Fee in USDC (6 decimals). E.g. 30000 = $0.03
     function setOperationFee(uint256 newFee) external onlyAdmin {
@@ -229,15 +249,19 @@ contract PredmartPoolExtension {
         emit OperationFeeUpdated(newFee);
     }
 
-    /// @notice Withdraw accumulated USDC operation fees (for relayer gas top-up)
-    function withdrawOperationFees(uint256 amount) external onlyAdmin {
+    /// @notice Withdraw accumulated USDC operation fees (for relayer gas top-up).
+    /// Callable by admin or relayer. USDC is sent to the caller.
+    function withdrawOperationFees(uint256 amount) external {
+        if (msg.sender != admin && msg.sender != relayer) revert NotAdmin();
         if (amount > operationFeePool) amount = operationFeePool;
         operationFeePool -= amount;
-        IERC20(_asset()).safeTransfer(admin, amount);
+        IERC20(_asset()).safeTransfer(msg.sender, amount);
     }
 
-    /// @notice Withdraw accumulated CTF fee shares (for CLOB sale → relayer gas)
-    function withdrawFeeShares(uint256 tokenId, uint256 amount, address to) external onlyAdmin {
+    /// @notice Withdraw accumulated CTF fee shares (for CLOB sale → relayer gas).
+    /// Callable by admin or relayer.
+    function withdrawFeeShares(uint256 tokenId, uint256 amount, address to) external {
+        if (msg.sender != admin && msg.sender != relayer) revert NotAdmin();
         if (amount > feeSharesAccumulated[tokenId]) amount = feeSharesAccumulated[tokenId];
         feeSharesAccumulated[tokenId] -= amount;
         ICTF(ctf).safeTransferFrom(address(this), to, tokenId, amount, "");
@@ -247,7 +271,8 @@ contract PredmartPoolExtension {
     ///         When fee shares are still in the contract at redemption time, they get redeemed
     ///         with user collateral but no borrower can claim the pro-rata USDC. This moves
     ///         that orphaned USDC from unsettledRedemptions into operationFeePool.
-    function sweepRedeemedFeeShares(uint256 tokenId) external onlyAdmin {
+    function sweepRedeemedFeeShares(uint256 tokenId) external {
+        if (msg.sender != admin && msg.sender != relayer) revert NotAdmin();
         Redemption storage r = redeemedTokens[tokenId];
         if (!r.redeemed) revert TokenNotRedeemed();
         uint256 feeShares = feeSharesAccumulated[tokenId];
@@ -351,10 +376,11 @@ contract PredmartPoolExtension {
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
         if (elapsed == 0) return;
 
-        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances;
+        uint256 totalLiquidity = IERC20(_asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances + totalPendingLiquidations;
         totalLiquidity = totalLiquidity > totalReserves ? totalLiquidity - totalReserves : 0;
         totalLiquidity = totalLiquidity > unsettledRedemptions ? totalLiquidity - unsettledRedemptions : 0;
         totalLiquidity = totalLiquidity > operationFeePool ? totalLiquidity - operationFeePool : 0;
+        totalLiquidity = totalLiquidity > protocolFeePool ? totalLiquidity - protocolFeePool : 0;
         uint256 utilization = totalLiquidity == 0 ? 0 : totalBorrowAssets.mulDiv(1e18, totalLiquidity);
 
         (uint256 interest, uint256 reserveShare) = PredmartPoolLib.calcPendingInterest(
@@ -517,6 +543,19 @@ contract PredmartPoolExtension {
         unsettledRedemptions = unsettledRedemptions > proceeds ? unsettledRedemptions - proceeds : 0;
 
         uint256 surplus = proceeds > debt ? proceeds - debt : 0;
+
+        // Profit fee: 10% of profit (surplus above initial equity)
+        // Legacy positions (initialEquity == 0) are exempt
+        uint256 initialEquity = pos.initialEquity;
+        if (initialEquity > 0 && surplus > initialEquity) {
+            uint256 profit = surplus - initialEquity;
+            uint256 poolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_POOL, 1e18);
+            uint256 protocolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_PROTOCOL, 1e18);
+            surplus -= (poolFee + protocolFee);
+            protocolFeePool += protocolFee;
+            emit ProfitFeeCollected(borrower, tokenId, poolFee, protocolFee);
+        }
+
         if (debt > proceeds) emit BadDebtAbsorbed(borrower, tokenId, debt - proceeds);
         delete positions[borrower][tokenId];
 
@@ -531,17 +570,18 @@ contract PredmartPoolExtension {
                             LIQUIDATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Liquidate an unhealthy position. Relayer-only.
+    /// @notice v2 Liquidate an unhealthy position — seize ALL collateral, sell later.
+    /// @dev Seize-first model: liquidator receives all shares, sells on CLOB,
+    ///      then calls settleLiquidation() with proceeds. No upfront USDC required.
+    ///      Only callable by the dedicated liquidator wallet.
+    ///      Intentionally lacks whenNotPaused: during emergencies, liquidation must continue
+    ///      to protect lenders from accumulating bad debt.
     function liquidate(
         address borrower,
         uint256 tokenId,
-        uint256 repayAmount,
         PredmartOracle.PriceData calldata priceData
     ) external {
-        if (msg.sender != relayer) revert NotRelayer();
-        if (paused) revert ProtocolPaused();
-        // Block liquidation on lost markets (shares worth $0 — liquidator would get worthless collateral).
-        // Won markets stay liquidatable — ensures lenders can always recover debt.
+        if (msg.sender != liquidator) revert NotLiquidator();
         MarketResolution memory resolution = resolvedMarkets[tokenId];
         if (resolution.resolved && !resolution.won) revert MarketResolved();
         if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
@@ -556,46 +596,86 @@ contract PredmartPoolExtension {
         uint256 healthFactor = _getHealthFactorInline(pos.collateralAmount, debt, price);
         if (healthFactor >= 1e18) revert PositionHealthy();
 
-        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
-            pos.collateralAmount, debt, healthFactor, price, repayAmount
-        );
+        uint256 collateral = pos.collateralAmount;
 
-        uint256 sharesToBurn;
-        if (vars.repayAmount >= debt) {
-            sharesToBurn = pos.borrowShares;
-            vars.repayAmount = debt;
+        // Record pending liquidation (settled after CLOB sale)
+        pendingLiquidations[borrower][tokenId] = PendingLiquidation({
+            liquidator: msg.sender,
+            debt: debt,
+            collateral: collateral,
+            timestamp: block.timestamp
+        });
+        totalPendingLiquidations += debt;
+
+        // Zero out position — burn all borrow shares, clear all tracking
+        _reduceBorrowTrackingInline(tokenId, debt, pos.borrowShares,
+            pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : debt);
+        delete positions[borrower][tokenId];
+
+        // Transfer ALL shares to liquidator
+        ICTF(ctf).safeTransferFrom(address(this), msg.sender, tokenId, collateral, "");
+
+        emit Liquidated(msg.sender, borrower, tokenId, collateral, debt);
+    }
+
+    /// @notice Settle a pending liquidation after the liquidator sold shares on CLOB.
+    /// @param borrower The liquidated borrower
+    /// @param tokenId The token ID of the liquidated position
+    /// @param saleProceeds Total USDC received from CLOB sale
+    function settleLiquidation(
+        address borrower,
+        uint256 tokenId,
+        uint256 saleProceeds
+    ) external {
+        PendingLiquidation memory pending = pendingLiquidations[borrower][tokenId];
+        if (pending.liquidator == address(0)) revert NoPendingLiquidation();
+        if (msg.sender != pending.liquidator) revert NotLiquidator();
+
+        uint256 debt = pending.debt;
+
+        // Clean up pending state BEFORE external calls (CEI pattern)
+        totalPendingLiquidations = totalPendingLiquidations > debt
+            ? totalPendingLiquidations - debt : 0;
+        delete pendingLiquidations[borrower][tokenId];
+
+        // Pull ALL proceeds from caller
+        if (saleProceeds > 0) {
+            IERC20(_asset()).safeTransferFrom(msg.sender, address(this), saleProceeds);
+        }
+
+        if (saleProceeds >= debt) {
+            // Solvent: repay debt + distribute
+            uint256 liquidatorFee = debt.mulDiv(PredmartPoolLib.LIQUIDATOR_FEE, 1e18);
+            uint256 surplus = saleProceeds - debt;
+
+            // Fee to liquidator (msg.sender == pending.liquidator, verified above)
+            if (liquidatorFee > 0) {
+                IERC20(_asset()).safeTransfer(msg.sender, liquidatorFee);
+            }
+
+            // Remaining surplus stays in contract (increases totalAssets for lenders)
+            // Borrower gets $0
+
+            emit LiquidationSettled(borrower, tokenId, debt, liquidatorFee, surplus);
         } else {
-            sharesToBurn = _toBorrowSharesInline(vars.repayAmount, Math.Rounding.Floor);
+            // Insolvent: bad debt socialized to lenders
+            uint256 badDebt = debt - saleProceeds;
+            emit BadDebtAbsorbed(borrower, tokenId, badDebt);
         }
+    }
 
-        uint256 pr = pos.borrowedPrincipal == 0 ? vars.repayAmount
-            : sharesToBurn >= pos.borrowShares ? pos.borrowedPrincipal
-            : pos.borrowedPrincipal.mulDiv(sharesToBurn, pos.borrowShares, Math.Rounding.Floor);
-        pos.borrowedPrincipal = pos.borrowedPrincipal > pr ? pos.borrowedPrincipal - pr : 0;
+    /// @notice Expire a pending liquidation that wasn't settled within CLOSE_TIMEOUT.
+    /// @dev Permissionless — anyone can call after timeout. Full debt becomes bad debt.
+    function expirePendingLiquidation(address borrower, uint256 tokenId) external {
+        PendingLiquidation memory pending = pendingLiquidations[borrower][tokenId];
+        if (pending.liquidator == address(0)) revert NoPendingLiquidation();
+        if (block.timestamp < pending.timestamp + 1 hours) revert TooEarly();
 
-        IERC20(_asset()).safeTransferFrom(msg.sender, address(this), vars.liquidatorCost);
+        totalPendingLiquidations = totalPendingLiquidations > pending.debt
+            ? totalPendingLiquidations - pending.debt : 0;
+        delete pendingLiquidations[borrower][tokenId];
 
-        pos.borrowShares -= sharesToBurn;
-        pos.collateralAmount -= vars.seizeCollateral;
-        _reduceBorrowTrackingInline(tokenId, vars.repayAmount, sharesToBurn, pr);
-
-        if (pos.collateralAmount == 0 && pos.borrowShares > 0) {
-            uint256 residualDebt = _toBorrowAssetsInline(pos.borrowShares);
-            uint256 rp = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : residualDebt;
-            pos.borrowedPrincipal = 0;
-            _reduceBorrowTrackingInline(tokenId, residualDebt, pos.borrowShares, rp);
-            vars.badDebt += residualDebt;
-            pos.borrowShares = 0;
-        }
-
-        if (pos.collateralAmount == 0 && pos.borrowShares == 0) {
-            delete positions[borrower][tokenId];
-        }
-
-        ICTF(ctf).safeTransferFrom(address(this), msg.sender, tokenId, vars.seizeCollateral, "");
-
-        emit Liquidated(msg.sender, borrower, tokenId, vars.seizeCollateral, vars.liquidatorCost);
-        if (vars.badDebt > 0) emit BadDebtAbsorbed(borrower, tokenId, vars.badDebt);
+        emit BadDebtAbsorbed(borrower, tokenId, pending.debt);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -603,9 +683,7 @@ contract PredmartPoolExtension {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Settle a pending flash close after the relayer sold shares on CLOB.
-    /// @dev Only callable by relayer. The relayer is trusted to report honest saleProceeds —
-    ///      under-reporting would steal user surplus. Relayer rotation is timelocked (6h).
-    ///      Follows checks-effects-interactions: state changes before external transfers.
+    /// @dev Only callable by relayer. v2: deducts profit fee (10% of profit above initial equity).
     /// @param borrower The position owner
     /// @param tokenId The token ID of the closed position
     /// @param saleProceeds USDC received from CLOB sale (6 decimals)
@@ -618,20 +696,22 @@ contract PredmartPoolExtension {
         // ── Checks ──
         uint256 debtAmount = pending.debtAmount;
         address surplusRecipient = pending.surplusRecipient;
+        uint256 initialEquity = pending.initialEquity;
 
-        // Calculate surplus/badDebt BEFORE fee deduction (lender protection takes priority)
         uint256 surplus = saleProceeds > debtAmount ? saleProceeds - debtAmount : 0;
         uint256 badDebt = debtAmount > saleProceeds ? debtAmount - saleProceeds : 0;
         uint256 repaid = saleProceeds > debtAmount ? debtAmount : saleProceeds;
 
-        // Operation fee is deducted from surplus only (user pays, not lenders)
-        // If surplus < fee, fee is waived to protect lenders from bad debt
-        uint256 feeCollected = 0;
-        if (operationFee > 0 && surplus >= operationFee) {
-            feeCollected = operationFee;
-            operationFeePool += feeCollected;
-            surplus -= feeCollected;
-            emit OperationFeeCollected(borrower, feeCollected);
+        // Profit fee: 10% of profit (surplus above initial equity)
+        // 7% stays in pool (increases lender yield), 3% → protocol fee pool
+        // Legacy positions (initialEquity == 0) are exempt
+        if (initialEquity > 0 && surplus > initialEquity) {
+            uint256 profit = surplus - initialEquity;
+            uint256 poolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_POOL, 1e18);
+            uint256 protocolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_PROTOCOL, 1e18);
+            surplus -= (poolFee + protocolFee);
+            protocolFeePool += protocolFee;
+            emit ProfitFeeCollected(borrower, tokenId, poolFee, protocolFee);
         }
 
         // ── Effects ──
@@ -698,6 +778,13 @@ contract PredmartPoolExtension {
 
     event ReservesWithdrawn(address indexed to, uint256 amount);
 
+    /// @notice Withdraw accumulated protocol fees (3% of profit fees)
+    function withdrawProtocolFees(uint256 amount) external onlyAdmin {
+        if (amount > protocolFeePool) amount = protocolFeePool;
+        protocolFeePool -= amount;
+        IERC20(_asset()).safeTransfer(admin, amount);
+    }
+
     /// @notice Withdraw accumulated protocol reserves
     function withdrawReserves(uint256 amount) external onlyAdmin {
         _accrueInterestInline();
@@ -745,6 +832,7 @@ contract PredmartPoolExtension {
         uint256 advanceAmount
     ) external {
         if (msg.sender != relayer) revert NotRelayer();
+        if (paused) revert ProtocolPaused();
         if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
         if (block.timestamp > auth.deadline) revert IntentExpired();
         if (userAmount == 0 && advanceAmount == 0) revert BorrowTooSmall();
@@ -770,6 +858,8 @@ contract PredmartPoolExtension {
 
         // Pull USDC from user's Safe to relayer
         if (userAmount > 0) {
+            // Track user's equity for profit fee calculation (before external call — CEI)
+            positions[auth.borrower][auth.tokenId].initialEquity += userAmount;
             IERC20(_asset()).safeTransferFrom(auth.allowedFrom, msg.sender, userAmount);
             emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, userAmount, auth.tokenId);
         }
@@ -790,6 +880,7 @@ contract PredmartPoolExtension {
             if (cash > unsettledRedemptions) cash -= unsettledRedemptions; else cash = 0;
             if (cash > operationFeePool) cash -= operationFeePool; else cash = 0;
             if (cash > totalPendingAdvances) cash -= totalPendingAdvances; else cash = 0;
+            if (cash > protocolFeePool) cash -= protocolFeePool; else cash = 0;
             if (netAdvance > cash) revert InsufficientLiquidity();
 
             pendingAdvances[authHash] += netAdvance;

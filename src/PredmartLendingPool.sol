@@ -16,9 +16,9 @@ import { PredmartOracle } from "./PredmartOracle.sol";
 import { PredmartPoolLib } from "./PredmartPoolLib.sol";
 import { ICTF } from "./interfaces/ICTF.sol";
 import {
-    Position, MarketResolution, Redemption, PendingClose,
-    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer,
-    BadDebtAbsorbed, InterestAccrued, PositionCloseInitiated, OperationFeeCollected
+    Position, MarketResolution, Redemption, PendingClose, PendingLiquidation,
+    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NoPendingLiquidation, NotLiquidator,
+    BadDebtAbsorbed, InterestAccrued, PositionCloseInitiated, OperationFeeCollected, LiquidationSettled, ProfitFeeCollected
 } from "./PredmartTypes.sol";
 
 /// @title PredmartLendingPool
@@ -40,7 +40,7 @@ contract PredmartLendingPool is
                                CONSTANTS
     //////////////////////////////////////////////////////////////*/
 
-    string public constant VERSION = "1.7.0";
+    string public constant VERSION = "2.0.0";
 
     uint256 public constant MAX_RELAY_PRICE_AGE = 10 seconds;
     uint256 public constant NUM_ANCHORS = 7;
@@ -236,6 +236,16 @@ contract PredmartLendingPool is
     // v1.7.0 — NegRisk support: adapter for redeeming neg_risk CTF positions
     address public negRiskAdapter;
 
+    // v2.0.0 — Pending liquidations (seize-first model)
+    mapping(address => mapping(uint256 => PendingLiquidation)) public pendingLiquidations;
+    uint256 public totalPendingLiquidations;
+
+    // v2.0.0 — Protocol fee accumulator (3% of profit fees)
+    uint256 public protocolFeePool;
+
+    // v2.0.0 — Separate liquidator wallet (can call liquidate + settleLiquidation)
+    address public liquidator;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -295,10 +305,17 @@ contract PredmartLendingPool is
 
     // initializeV5, V7, V8, V9, V10 removed — already executed, reinitializer prevents reuse
 
-    /// @notice Initialize v1.7.0 — update extension + set NegRiskAdapter for neg_risk redemption
-    function initializeV11(address _extension, address _negRiskAdapter) public reinitializer(11) {
+    // initializeV11 removed — already executed, reinitializer prevents reuse
+
+    /// @notice Initialize v1.8.0 — update extension (fee withdrawal accessible by relayer)
+    function initializeV12(address _extension) public reinitializer(12) {
         extension = _extension;
-        negRiskAdapter = _negRiskAdapter;
+    }
+
+    /// @notice Initialize v2.0.0 — update extension for v2 (profit fees, full seizure liquidation)
+    function initializeV13(address _extension, address _liquidator) public reinitializer(13) {
+        extension = _extension;
+        liquidator = _liquidator;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -379,10 +396,11 @@ contract PredmartLendingPool is
     /// @dev Raw total assets without pending interest — used by getUtilization/getBorrowRate
     ///      to avoid circular dependency (_pendingInterest → getBorrowRate → getUtilization → totalAssets).
     function _totalAssetsStale() internal view returns (uint256) {
-        uint256 total = IERC20(asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances;
+        uint256 total = IERC20(asset()).balanceOf(address(this)) + totalBorrowAssets + totalPendingCloses + totalPendingAdvances + totalPendingLiquidations;
         total = total > totalReserves ? total - totalReserves : 0;
         total = total > unsettledRedemptions ? total - unsettledRedemptions : 0;
         total = total > operationFeePool ? total - operationFeePool : 0;
+        total = total > protocolFeePool ? total - protocolFeePool : 0;
         return total;
     }
 
@@ -393,6 +411,7 @@ contract PredmartLendingPool is
         cash = cash > unsettledRedemptions ? cash - unsettledRedemptions : 0;
         cash = cash > operationFeePool ? cash - operationFeePool : 0;
         cash = cash > totalPendingAdvances ? cash - totalPendingAdvances : 0;
+        cash = cash > protocolFeePool ? cash - protocolFeePool : 0;
         return cash;
     }
 
@@ -757,7 +776,8 @@ contract PredmartLendingPool is
             surplusRecipient: auth.allowedTo,
             debtAmount: debt,
             collateralAmount: collateralAmount,
-            deadline: block.timestamp + CLOSE_TIMEOUT
+            deadline: block.timestamp + CLOSE_TIMEOUT,
+            initialEquity: pos.initialEquity
         });
         totalPendingCloses += debt;
 
@@ -822,6 +842,14 @@ contract PredmartLendingPool is
         totalBorrowShares += shares;
         totalBorrowedPerToken[tokenId] += amount;
 
+        // Track initial equity for profit fee (non-leverage positions only).
+        // Leverage positions set initialEquity in pullUsdcForLeverage.
+        // Must be set before external transfer (CEI pattern).
+        if (pos.initialEquity == 0) {
+            uint256 totalDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
+            pos.initialEquity = collateralValue > totalDebt ? collateralValue - totalDebt : 0;
+        }
+
         // Transfer USDC (deduct operation fee + advance offset).
         // When offset > 0, fee was already charged in pullUsdcForLeverage — skip here.
         uint256 fee = (chargeFee && offset == 0) ? operationFee : 0;
@@ -878,19 +906,12 @@ contract PredmartLendingPool is
                             LIQUIDATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Liquidate an unhealthy position with partial close factor and capped incentives.
-    /// @dev Two paths based on solvency:
-    ///      ABOVE WATER (collateral >= debt): Partial liquidation. Liquidator repays up to closeFactor * debt,
-    ///        receives repayAmount * (1 + 5% bonus) / price worth of collateral. Borrower keeps the rest.
-    ///        Close factor = 50% if HF >= 0.95, 100% if HF < 0.95.
-    ///      UNDERWATER (collateral < debt): Full liquidation. Liquidator pays 90% of collateral value,
-    ///        receives all collateral. Bad debt (debt - payment) is socialized to lenders.
-    /// @param borrower Address of the borrower to liquidate
-    /// @param tokenId Token ID of the position to liquidate
-    /// @param repayAmount Maximum USDC the liquidator is willing to repay (ignored for underwater)
-    // NOTE: liquidate, resolveMarket, closeLostPosition, redeemWonCollateral, and settleRedemption
-    // have been moved to PredmartPoolExtension to free main contract bytecode space.
+    // NOTE: liquidate, resolveMarket, closeLostPosition, redeemWonCollateral, settleRedemption,
+    // settleLiquidation, and expirePendingLiquidation have been moved to PredmartPoolExtension.
     // They are accessible at the same address via the fallback() → delegatecall pattern.
+    //
+    // v2.0.0: liquidate() uses full collateral seizure (seize-first, sell-second model).
+    // Liquidator receives all shares, sells on CLOB, calls settleLiquidation() with proceeds.
 
     /*//////////////////////////////////////////////////////////////
                            RISK MODEL

@@ -17,70 +17,57 @@ library PredmartPoolLib {
 
     // Liquidation parameters
     uint256 public constant LIQUIDATION_BUFFER = 0.10e18;
-    uint256 public constant CLOSE_FACTOR = 0.50e18;
-    uint256 public constant FULL_CLOSE_HF = 0.95e18;
-    uint256 public constant LIQUIDATION_BONUS = 0.05e18;
-    uint256 public constant LIQUIDATION_DISCOUNT = 0.10e18;
 
     // Interest & reserve
-    uint256 public constant RESERVE_FACTOR = 0.05e18;
+    uint256 public constant RESERVE_FACTOR = 0.10e18;
     uint256 public constant SECONDS_PER_YEAR = 365.25 days;
 
     // Interest rate model (kink model)
-    uint256 public constant BASE_RATE = 0.05e18;
+    uint256 public constant BASE_RATE = 0.10e18;
     uint256 public constant KINK = 0.80e18;
-    uint256 public constant RATE_AT_KINK = 0.25e18;
-    uint256 public constant MAX_RATE = 3.00e18;
-    uint256 public constant SLOPE1 = 0.25e18;
+    uint256 public constant RATE_AT_KINK = 0.42e18;
+    uint256 public constant MAX_RATE = 3.17e18;
+    uint256 public constant SLOPE1 = 0.40e18;
     uint256 public constant SLOPE2 = 13.75e18;
 
-    /*//////////////////////////////////////////////////////////////
-                              STRUCTS
-    //////////////////////////////////////////////////////////////*/
+    // Profit fee — charged on borrower profit at position close
+    uint256 public constant PROFIT_FEE = 0.10e18;          // 10% total
+    uint256 public constant PROFIT_FEE_POOL = 0.07e18;     // 7% to lending pool
+    uint256 public constant PROFIT_FEE_PROTOCOL = 0.03e18; // 3% to protocol
 
-    struct LiquidationVars {
-        uint256 seizeCollateral;
-        uint256 liquidatorCost;
-        uint256 badDebt;
-        uint256 repayAmount;
-    }
+    // Liquidation incentive — paid to liquidator as % of debt
+    uint256 public constant LIQUIDATOR_FEE = 0.05e18;
 
     /*//////////////////////////////////////////////////////////////
                      LIQUIDATION CALCULATION
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Calculate liquidation amounts (pure math — no storage access)
+    /// @notice v2 simplified liquidation — always seize ALL collateral
     function calcLiquidation(
         uint256 collateralAmount,
-        uint256 debt,
-        uint256 healthFactor,
-        uint256 price,
-        uint256 repayAmount
-    ) external pure returns (LiquidationVars memory vars) {
-        uint256 collateralValue = collateralAmount.mulDiv(price, 1e18);
+        uint256 debt
+    ) external pure returns (uint256 seizeCollateral, uint256 repayAmount) {
+        seizeCollateral = collateralAmount;
+        repayAmount = debt;
+    }
 
-        if (collateralValue < debt) {
-            // ─── UNDERWATER: 100% close, 10% discount, bad debt socialized ───
-            vars.seizeCollateral = collateralAmount;
-            vars.liquidatorCost = collateralValue.mulDiv(1e18 - LIQUIDATION_DISCOUNT, 1e18, Math.Rounding.Floor);
-            vars.badDebt = debt - vars.liquidatorCost;
-            vars.repayAmount = debt;
-        } else {
-            // ─── ABOVE WATER: partial liquidation with 5% bonus ───
-            uint256 closeFactor = healthFactor < FULL_CLOSE_HF ? 1e18 : CLOSE_FACTOR;
-            uint256 maxRepay = debt.mulDiv(closeFactor, 1e18);
-            if (repayAmount > maxRepay) repayAmount = maxRepay;
+    /*//////////////////////////////////////////////////////////////
+                        PROFIT FEE CALCULATION
+    //////////////////////////////////////////////////////////////*/
 
-            vars.seizeCollateral = repayAmount.mulDiv(1e18 + LIQUIDATION_BONUS, price, Math.Rounding.Floor);
-
-            if (vars.seizeCollateral > collateralAmount) {
-                vars.seizeCollateral = collateralAmount;
-                repayAmount = vars.seizeCollateral.mulDiv(price, 1e18 + LIQUIDATION_BONUS, Math.Rounding.Ceil);
-            }
-
-            vars.liquidatorCost = repayAmount;
-            vars.repayAmount = repayAmount;
-        }
+    /// @notice Calculate profit fee split between pool and protocol
+    /// @param surplus USDC returned to borrower after debt repayment
+    /// @param initialEquity Borrower's original USDC investment (0 = legacy position, no fee)
+    /// @return poolFee Amount added to lending pool (7% of profit)
+    /// @return protocolFee Amount sent to protocol (3% of profit)
+    function calcProfitFee(
+        uint256 surplus,
+        uint256 initialEquity
+    ) external pure returns (uint256 poolFee, uint256 protocolFee) {
+        if (initialEquity == 0 || surplus <= initialEquity) return (0, 0);
+        uint256 profit = surplus - initialEquity;
+        poolFee = profit.mulDiv(PROFIT_FEE_POOL, 1e18);
+        protocolFee = profit.mulDiv(PROFIT_FEE_PROTOCOL, 1e18);
     }
 
     /*//////////////////////////////////////////////////////////////

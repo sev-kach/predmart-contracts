@@ -108,7 +108,7 @@ contract Handler is Test {
     /// @notice Borrower borrows via relay
     function borrow(uint256 amount) external {
         amount = bound(amount, 1e6, 20e6); // $1 to $20
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID);
         if (collateral == 0) return;
 
         uint256 nonce = pool.borrowNonces(borrower);
@@ -148,7 +148,7 @@ contract Handler is Test {
 
     /// @notice Borrower withdraws collateral via relay
     function withdrawCollateral(uint256 amount) external {
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID);
         if (collateral == 0) return;
         amount = bound(amount, 1, collateral);
 
@@ -366,7 +366,7 @@ contract InvariantLendingPoolTest is Test {
     /// @notice Pool's CTF balance must be >= sum of all tracked collateral + fee shares
     function invariant_ctfBalanceCoversPositions() public view {
         uint256 poolCTFBalance = ctf.balanceOf(address(pool), TOKEN_ID);
-        (uint256 borrowerCollateral,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 borrowerCollateral,,,,) = pool.positions(borrower, TOKEN_ID);
         uint256 feeShares = pool.feeSharesAccumulated(TOKEN_ID);
 
         // Pool must hold at least enough CTF for all positions + accumulated fee shares

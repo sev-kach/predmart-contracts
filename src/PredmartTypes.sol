@@ -15,6 +15,7 @@ struct Position {
     uint256 borrowShares;     // Shares of the global borrow pool owned by this position
     uint256 lastDepositTimestamp; // DEPRECATED — kept for storage layout compatibility
     uint256 borrowedPrincipal;   // v0.9.1 — cumulative USDC principal borrowed (for accurate per-token cap tracking)
+    uint256 initialEquity;       // v2.0.0 — user's USDC equity for profit fee calculation
 }
 
 struct MarketResolution {
@@ -33,6 +34,14 @@ struct PendingClose {
     uint256 debtAmount;       // USDC owed back to pool (6 decimals)
     uint256 collateralAmount; // Shares sent to relayer (for event tracking)
     uint256 deadline;         // block.timestamp + CLOSE_TIMEOUT
+    uint256 initialEquity;    // v2.0.0 — user's USDC equity for profit fee calc during settlement
+}
+
+struct PendingLiquidation {
+    address liquidator;       // Who seized the shares (gets LIQUIDATOR_FEE on settlement)
+    uint256 debt;             // USDC owed back to pool
+    uint256 collateral;       // Shares seized (for event tracking)
+    uint256 timestamp;        // When seized (for timeout)
 }
 
 /*//////////////////////////////////////////////////////////////
@@ -45,6 +54,8 @@ error NoPosition();
 error TimelockNotReady();
 error NoPendingChange();
 error NotRelayer();
+error NoPendingLiquidation();
+error NotLiquidator();
 
 /*//////////////////////////////////////////////////////////////
                         SHARED EVENTS
@@ -55,3 +66,5 @@ event InterestAccrued(uint256 interest, uint256 reserve);
 event PositionCloseInitiated(address indexed borrower, uint256 indexed tokenId, uint256 debtAmount, uint256 collateralAmount);
 event OperationFeeCollected(address indexed payer, uint256 amount);
 event OperationFeeUpdated(uint256 newFee);
+event LiquidationSettled(address indexed borrower, uint256 indexed tokenId, uint256 debtRepaid, uint256 liquidatorFee, uint256 surplus);
+event ProfitFeeCollected(address indexed borrower, uint256 indexed tokenId, uint256 poolFee, uint256 protocolFee);

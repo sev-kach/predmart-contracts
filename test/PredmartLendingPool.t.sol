@@ -9,7 +9,7 @@ import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
 import { PredmartOracle } from "../src/PredmartOracle.sol";
 import { PredmartPoolLib } from "../src/PredmartPoolLib.sol";
-import { NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer } from "../src/PredmartTypes.sol";
+import { NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NotLiquidator } from "../src/PredmartTypes.sol";
 import { MockUSDC } from "./mocks/MockUSDC.sol";
 import { MockCTF } from "./mocks/MockCTF.sol";
 
@@ -114,9 +114,13 @@ contract PredmartLendingPoolTest is Test {
         ctf.mint(borrower, TOKEN_ID_YES, 10_000e6);
         ctf.mint(borrower, TOKEN_ID_NO, 5_000e6);
 
-        // Relayer approves pool for liquidation payments
+        // Relayer approves pool
         vm.prank(relayer);
         usdc.approve(address(pool), type(uint256).max);
+
+        // Set liquidator wallet
+        vm.prank(admin);
+        poolAdmin.setLiquidator(liquidator);
 
         // Safe approves pool for deleverage repayments (USDC pull)
         vm.prank(safe);
@@ -350,7 +354,7 @@ contract PredmartLendingPoolTest is Test {
         pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
         vm.stopPrank();
 
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
         assertEq(ctf.balanceOf(address(pool), TOKEN_ID_YES), 5_000e6);
     }
@@ -380,7 +384,7 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         pool.withdrawViaRelay(intent, sig, dummyPrice);
 
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 3_000e6);
     }
 
@@ -414,7 +418,7 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
-        (uint256 collateral, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
         assertGt(borrowShares, 0);
         assertEq(pool.totalBorrowAssets(), 2_000e6);
@@ -483,7 +487,7 @@ contract PredmartLendingPoolTest is Test {
         pool.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
-        (,uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (,uint256 debt,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(debt, 0);
         assertEq(pool.totalBorrowAssets(), 0);
     }
@@ -497,7 +501,7 @@ contract PredmartLendingPoolTest is Test {
         pool.repay(TOKEN_ID_YES, 500e6);
         vm.stopPrank();
 
-        (,uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (,uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertGt(borrowShares, 0);
         assertEq(pool.totalBorrowAssets(), 1_500e6);
     }
@@ -553,17 +557,17 @@ contract PredmartLendingPoolTest is Test {
         // HF = 5000 * 0.50 * 0.80 / 2700 = 2000 / 2700 ≈ 0.74
         PredmartOracle.PriceData memory lowPrice = _signPrice(TOKEN_ID_YES, 0.50e18);
 
-        // Relayer calls liquidate (USDC comes from relayer)
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, lowPrice);
+        // Liquidator calls liquidate
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,lowPrice);
 
         // Position should be deleted
-        (uint256 collateral, uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 debt,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(debt, 0);
 
-        // Relayer should have the collateral (collateral goes to msg.sender)
-        assertEq(ctf.balanceOf(relayer, TOKEN_ID_YES), 5_000e6);
+        // Liquidator received the shares (collateral goes to msg.sender)
+        assertEq(ctf.balanceOf(liquidator, TOKEN_ID_YES), 5_000e6);
 
         // Pool totalBorrowed should decrease
         assertEq(pool.totalBorrowAssets(), 0);
@@ -574,21 +578,19 @@ contract PredmartLendingPoolTest is Test {
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
         // Price stays at $0.80 — position is healthy
-        vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.PositionHealthy.selector);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,_signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
-    function test_Liquidate_RevertsNotRelayer() public {
+    function test_Liquidate_RevertsNotLiquidator() public {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
-        // Non-relayer tries to liquidate
-        vm.startPrank(liquidator);
-        usdc.approve(address(pool), type(uint256).max);
-        vm.expectRevert(NotRelayer.selector);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
-        vm.stopPrank();
+        // Non-liquidator (relayer) tries to liquidate — reverts
+        vm.expectRevert(NotLiquidator.selector);
+        vm.prank(relayer);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, _signPrice(TOKEN_ID_YES, 0.50e18));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -611,7 +613,7 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.closeLostPosition(borrower, TOKEN_ID_YES);
 
         // Position should still exist (must go through redeemWonCollateral + settleRedemption)
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6);
     }
 
@@ -626,7 +628,7 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.closeLostPosition(borrower, TOKEN_ID_YES);
 
         // Position should be deleted (bad debt written off)
-        (uint256 collateral, uint256 debt,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 debt,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(debt, 0);
         assertEq(pool.totalBorrowAssets(), 0);
@@ -682,8 +684,8 @@ contract PredmartLendingPoolTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function test_BorrowRate_ZeroUtilization() public view {
-        // No borrows — should return base rate (5%)
-        assertEq(pool.getBorrowRate(), 0.05e18);
+        // No borrows — should return base rate (10%)
+        assertEq(pool.getBorrowRate(), 0.10e18);
     }
 
     function test_BorrowRate_AtKink() public {
@@ -906,19 +908,24 @@ contract PredmartLendingPoolTest is Test {
         assertGt(redeemable, 0);
     }
 
-    function test_Pause_BlocksLiquidation() public {
+    function test_Pause_AllowsLiquidation() public {
         vm.prank(admin);
         poolAdmin.setPoolCapBps(0);
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_700e6, 0.80e18);
 
+        // Set liquidator and pause
+        vm.prank(admin);
+        poolAdmin.setLiquidator(liquidator);
         vm.prank(admin);
         poolAdmin.setPaused(true);
 
-        // Liquidation blocked during pause (protects against compromised oracle)
-        vm.expectRevert(PredmartLendingPool.ProtocolPaused.selector);
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        // v2: liquidation works during pause (lender protection takes priority)
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, _signPrice(TOKEN_ID_YES, 0.50e18));
+
+        (uint256 col,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(col, 0, "Position liquidated even while paused");
     }
 
     function test_Unpause() public {
@@ -933,7 +940,7 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 2_000e6, 0.80e18);
 
-        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertGt(borrowShares, 0);
     }
 
@@ -964,8 +971,8 @@ contract PredmartLendingPoolTest is Test {
         _depositAndBorrow(borrower, TOKEN_ID_NO, 2_000e6, 800e6, 0.80e18);
 
         // Both positions should exist independently
-        (uint256 collYes, uint256 sharesYes,,) = pool.positions(borrower, TOKEN_ID_YES);
-        (uint256 collNo, uint256 sharesNo,,) = pool.positions(borrower, TOKEN_ID_NO);
+        (uint256 collYes, uint256 sharesYes,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collNo, uint256 sharesNo,,,) = pool.positions(borrower, TOKEN_ID_NO);
         assertEq(collYes, 3_000e6);
         assertGt(sharesYes, 0);
         assertEq(collNo, 2_000e6);
@@ -988,15 +995,15 @@ contract PredmartLendingPoolTest is Test {
 
         // YES price drops — position becomes unhealthy
         // NO price stays high — position is fine
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,_signPrice(TOKEN_ID_YES, 0.50e18));
 
         // YES position liquidated
-        (uint256 collYes,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collYes,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collYes, 0);
 
         // NO position untouched
-        (uint256 collNo, uint256 sharesNo,,) = pool.positions(borrower, TOKEN_ID_NO);
+        (uint256 collNo, uint256 sharesNo,,,) = pool.positions(borrower, TOKEN_ID_NO);
         assertEq(collNo, 5_000e6);
         assertGt(sharesNo, 0);
     }
@@ -1118,8 +1125,8 @@ contract PredmartLendingPoolTest is Test {
         assertEq(trackedBefore, 2_000e6);
 
         // Price drops → liquidate (via relayer)
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,_signPrice(TOKEN_ID_YES, 0.50e18));
 
         // Tracked amount should decrease
         assertLt(pool.totalBorrowedPerToken(TOKEN_ID_YES), trackedBefore);
@@ -1592,7 +1599,7 @@ contract PredmartLendingPoolTest is Test {
         pool.leverageDeposit(auth, sig, relayer, relayer, 2_000e6, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
 
         // Verify: borrower's position now has 5000 collateral (3000 initial + 2000 from leverage)
-        (uint256 collateral, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6, "Collateral includes leveraged deposit");
         assertGt(borrowShares, 0, "Borrow shares created");
         assertEq(pool.leverageNonces(borrower), nonce + 1, "Nonce consumed on first borrow");
@@ -1630,7 +1637,7 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         pool.leverageDeposit(auth, sig, relayer, relayer, 2_000e6, 0, _signPrice(TOKEN_ID_YES, 0.80e18));
 
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 3_000e6, "Collateral increased");
         assertEq(pool.leverageNonces(borrower), nonce, "Nonce unchanged on deposit-only");
     }
@@ -1814,7 +1821,7 @@ contract PredmartLendingPoolTest is Test {
         // Borrow exactly $1 (MIN_BORROW = 1e6)
         _depositAndBorrow(borrower, TOKEN_ID_YES, 5_000e6, 1e6, 0.80e18);
 
-        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertGt(borrowShares, 0, "Position created at MIN_BORROW");
         assertEq(pool.totalBorrowAssets(), 1e6);
     }
@@ -1835,7 +1842,7 @@ contract PredmartLendingPoolTest is Test {
         pool.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
-        (, uint256 borrowShares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(borrowShares, 0, "All shares burned");
         assertEq(pool.totalBorrowShares(), 0, "Global shares zeroed");
     }
@@ -1900,7 +1907,7 @@ contract PredmartLendingPoolTest is Test {
         pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
         vm.stopPrank();
 
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 1_000e6);
     }
 
@@ -1928,16 +1935,23 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 totalAssetsBefore = pool.totalAssets();
 
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, crashPrice);
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,crashPrice);
 
         // Position fully deleted
-        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(shares, 0);
 
-        // Bad debt socialized — totalAssets decreased
-        assertLt(pool.totalAssets(), totalAssetsBefore, "Bad debt socialized to lenders");
+        // v2: totalAssets stable after liquidate() — debt moved to totalPendingLiquidations
+        // Bad debt only realized on settleLiquidation with insufficient proceeds
+        uint256 totalAssetsAfterLiq = pool.totalAssets();
+
+        // Settle with 0 proceeds (shares worthless) → bad debt
+        vm.prank(liquidator);
+        poolAdmin.settleLiquidation(borrower, TOKEN_ID_YES, 0);
+
+        assertLt(pool.totalAssets(), totalAssetsAfterLiq, "Bad debt socialized to lenders after settlement");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1956,7 +1970,7 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.closeLostPosition(borrower, TOKEN_ID_YES);
 
         // Position untouched
-        (uint256 collateral, uint256 borrowSharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 borrowSharesAfter,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 5_000e6, "Collateral preserved");
         assertGt(borrowSharesAfter, 0, "Debt preserved");
     }
@@ -1968,7 +1982,7 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.resolveMarket(TOKEN_ID_YES, _signResolution(TOKEN_ID_YES, false));
         poolAdmin.closeLostPosition(borrower, TOKEN_ID_YES);
 
-        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0, "Position deleted on lost market");
         assertEq(shares, 0);
     }
@@ -2018,14 +2032,16 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.settleRedemption(borrower, TOKEN_ID_YES);
 
         // Position deleted
-        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(shares, 0);
 
-        // Borrower received surplus
+        // Borrower received surplus (reduced by profit fee in v2)
+        // equity = collateralValue - debt = 4000 - 2000 = 2000, profit = 3000 - 2000 = 1000
+        // fee = 10% of 1000 = 100 → user receives ~2900
         uint256 surplus = usdc.balanceOf(borrower) - borrowerBalBefore;
-        assertGt(surplus, 2_900e6, "Surplus: proceeds - debt");
-        assertLt(surplus, 3_100e6); // Allow for small interest
+        assertGt(surplus, 2_800e6, "Surplus: proceeds - debt - profit fee");
+        assertLt(surplus, 2_950e6);
         assertEq(pool.unsettledRedemptions(), 0, "Unsettled cleared");
     }
 
@@ -2056,7 +2072,7 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.settleRedemption(borrower, TOKEN_ID_YES);
 
         // Position deleted, bad debt absorbed
-        (uint256 collateral, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 0);
         assertEq(shares, 0);
 
@@ -2122,9 +2138,9 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 rate = PredmartPoolLib.calcBorrowRate(utilization);
 
-        // Rate must be at least BASE_RATE and at most MAX_RATE
-        assertGe(rate, 0.05e18, "Rate >= base rate");
-        assertLe(rate, 3.00e18 + 0.05e18, "Rate bounded above");
+        // Rate must be at least BASE_RATE (10%) and at most MAX_RATE (3.17)
+        assertGe(rate, 0.10e18, "Rate >= base rate");
+        assertLe(rate, 3.17e18 + 0.01e18, "Rate bounded above");
     }
 
     function testFuzz_CalcPendingInterest_NonNegative(
@@ -2224,7 +2240,7 @@ contract PredmartLendingPoolTest is Test {
         pool.depositCollateralFrom(borrower, TOKEN_ID_YES, 2_000e6);
         vm.stopPrank();
 
-        (uint256 collateral,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 2_000e6);
     }
 
@@ -2242,34 +2258,30 @@ contract PredmartLendingPoolTest is Test {
        TEST: PARTIAL LIQUIDATION (above water, HF >= 0.95)
     //////////////////////////////////////////////////////////////*/
 
-    function test_Liquidation_Partial_AboveWater() public {
+    function test_Liquidation_FullSeizure_v2() public {
         vm.prank(admin);
         poolAdmin.setPoolCapBps(0);
         _supply(lender, 50_000e6);
 
-        // Position that becomes slightly unhealthy (HF just below 1.0 but above 0.95)
         _depositAndBorrow(borrower, TOKEN_ID_YES, 10_000e6, 5_000e6, 0.80e18);
 
-        // Price drops slightly so HF is between 0.95 and 1.0
-        // At $0.70: threshold = LTV(0.70) + 10% = 65.5% + 10% = 75.5%
-        // HF = 10000 * 0.70 * 0.755 / 5000 = 1.057 — still healthy
-        // At $0.65: threshold = LTV(0.65) + 10% = 62.5% + 10% = 72.5%
-        // HF = 10000 * 0.65 * 0.725 / 5000 = 0.9425 — unhealthy, HF < 0.95 = full close
-
-        // Try at price that gives HF ~0.98 (slightly unhealthy, close factor = 50%)
-        // At $0.68: LTV = interpolated, threshold = LTV + 10%
-        // Let's just check the partial liquidation works with a moderate price drop
         PredmartOracle.PriceData memory lowPrice = _signPrice(TOKEN_ID_YES, 0.66e18);
 
-        uint256 collBefore = 10_000e6;
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, 2_000e6, lowPrice); // Partial repay: 2000 USDC
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, lowPrice);
 
-        (uint256 collAfter, uint256 sharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
-        // Position should still exist (partial liquidation)
-        assertGt(collAfter, 0, "Collateral remains after partial liq");
-        assertLt(collAfter, collBefore, "Some collateral seized");
-        assertGt(sharesAfter, 0, "Debt remains");
+        // v2: full seizure — position fully deleted
+        (uint256 collAfter, uint256 sharesAfter,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collAfter, 0, "All collateral seized");
+        assertEq(sharesAfter, 0, "All debt cleared");
+
+        // Pending liquidation created
+        (address liqAddr, uint256 debt,,) = pool.pendingLiquidations(borrower, TOKEN_ID_YES);
+        assertEq(liqAddr, liquidator, "Liquidator recorded");
+        assertGt(debt, 0, "Debt recorded in pending");
+
+        // Liquidator received the shares
+        assertEq(ctf.balanceOf(liquidator, TOKEN_ID_YES), 10_000e6, "Liquidator received all shares");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2332,7 +2344,7 @@ contract PredmartLendingPoolTest is Test {
         vm.stopPrank();
 
         // Invariant: no dust shares remain
-        (, uint256 sharesAfter,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (, uint256 sharesAfter,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(sharesAfter, 0, "Full repay must zero shares");
 
         // Invariant: global tracking is consistent
@@ -2356,19 +2368,15 @@ contract PredmartLendingPoolTest is Test {
         uint256 hf = PredmartPoolLib.calcHealthFactor(collateral, debt, price, threshold);
         if (hf >= 1e18) return; // Healthy — skip
 
-        PredmartPoolLib.LiquidationVars memory vars = PredmartPoolLib.calcLiquidation(
-            collateral, debt, hf, price, type(uint256).max
+        (uint256 seizeCollateral, uint256 repayAmount) = PredmartPoolLib.calcLiquidation(
+            collateral, debt
         );
 
-        // Seized collateral cannot exceed total collateral
-        assertLe(vars.seizeCollateral, collateral, "Cannot seize more than exists");
+        // v2: always seizes all collateral
+        assertEq(seizeCollateral, collateral, "Must seize all collateral");
 
-        // Liquidator cost should never exceed the value they receive
-        uint256 seizedValue = (vars.seizeCollateral * price) / 1e18;
-        assertGe(seizedValue, vars.liquidatorCost, "Liquidator must not overpay");
-
-        // repayAmount should never exceed total debt
-        assertLe(vars.repayAmount, debt, "Cannot repay more than owed");
+        // repayAmount equals total debt
+        assertEq(repayAmount, debt, "Must repay all debt");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2419,7 +2427,7 @@ contract PredmartLendingPoolTest is Test {
         pool.initiateClose(auth, sig, priceData);
 
         // Position deleted
-        (uint256 col, uint256 shares,,) = pool.positions(borrower, TOKEN_ID_YES);
+        (uint256 col, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(col, 0, "Collateral should be 0");
         assertEq(shares, 0, "Borrow shares should be 0");
 
@@ -2709,7 +2717,7 @@ contract PredmartLendingPoolTest is Test {
         assertApproxEqAbs(pool.totalAssets(), totalAssetsBefore, 1, "Invariant after first settle");
 
         // Second position still active
-        (uint256 col2,,,) = pool.positions(borrower, TOKEN_ID_NO);
+        (uint256 col2,,,,) = pool.positions(borrower, TOKEN_ID_NO);
         assertGt(col2, 0, "Second position should still exist");
     }
 
@@ -2921,15 +2929,13 @@ contract PredmartLendingPoolTest is Test {
         assertEq(pool.operationFeePool(), 30_000, "No additional fee on second borrow");
     }
 
-    function test_settleClose_deductsFeeFromProceeds() public {
+    function test_settleClose_profitFee_v2() public {
         _supply(lender, 50_000e6);
-        _enableFee();
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
+        // equity = 1000*0.80 - 400 = 400
         uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
-        uint256 feePoolBefore = pool.operationFeePool(); // 30000 from borrow
 
-        // Flash close
         (
             PredmartLendingPool.CloseAuth memory auth,
             bytes memory sig,
@@ -2938,19 +2944,20 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         pool.initiateClose(auth, sig, priceData);
 
-        // Settle with proceeds that give surplus
-        uint256 saleProceeds = 790e6; // 1000 shares * $0.79
+        // Sell at higher price to generate profit
+        uint256 saleProceeds = 900e6; // 1000 shares * $0.90 → surplus = 500
         uint256 safeBalBefore = usdc.balanceOf(safe);
 
         vm.prank(relayer);
         poolAdmin.settleClose(borrower, TOKEN_ID_YES, saleProceeds);
 
-        // Fee deducted from proceeds: net = 790 - 0.03 = 789.97
-        // Surplus = 789.97 - debt
-        uint256 expectedSurplus = saleProceeds - 30_000 - debt;
+        // surplus = 900 - 400 = 500, equity = 400, profit = 100
+        // profitFee = 10% of 100 = 10 (7 pool + 3 protocol)
+        // user receives = 500 - 10 = 490
         uint256 safeReceived = usdc.balanceOf(safe) - safeBalBefore;
-        assertEq(safeReceived, expectedSurplus, "Surplus reduced by fee");
-        assertEq(pool.operationFeePool() - feePoolBefore, 30_000, "settleClose added $0.03 to fee pool");
+        uint256 expectedSurplus = saleProceeds - debt - 10e6;
+        assertEq(safeReceived, expectedSurplus, "Surplus reduced by profit fee");
+        assertEq(pool.protocolFeePool(), 3e6, "3% of profit to protocol");
     }
 
     function test_settleClose_feeSkippedIfProceedsTooLow() public {
@@ -2983,8 +2990,8 @@ contract PredmartLendingPoolTest is Test {
 
         // Price drops → position unhealthy
         uint256 feePoolBefore = pool.operationFeePool();
-        vm.prank(relayer);
-        poolAdmin.liquidate(borrower, TOKEN_ID_YES, type(uint256).max, _signPrice(TOKEN_ID_YES, 0.50e18));
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES,_signPrice(TOKEN_ID_YES, 0.50e18));
 
         // No fee charged for liquidation
         assertEq(pool.operationFeePool(), feePoolBefore, "Liquidation should not charge fee");

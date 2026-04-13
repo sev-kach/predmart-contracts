@@ -28,6 +28,7 @@ library PredmartOracle {
 
     error PriceTooOld();
     error PriceTooHigh();
+    error PriceZero();
     error PriceFromFuture();
     error InvalidOracleSignature();
     error ResolutionTooOld();
@@ -48,6 +49,7 @@ library PredmartOracle {
     ) internal view returns (uint256) {
         if (data.timestamp > block.timestamp) revert PriceFromFuture();
         if (block.timestamp - data.timestamp > maxAge) revert PriceTooOld();
+        if (data.price == 0) revert PriceZero();
         if (data.price > 1e18) revert PriceTooHigh();
 
         bytes32 hash = keccak256(abi.encodePacked(block.chainid, pool, data.tokenId, data.price, data.timestamp, data.maxBorrow));
