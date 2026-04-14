@@ -12,7 +12,7 @@ Prediction market traders face a fundamental capital efficiency problem: once yo
 
 **For borrowers:** Deposit your Polymarket shares (ERC-1155 CTF tokens) as collateral and borrow USDC. Use that USDC to buy more shares — enabling leveraged trading on any prediction market on Polygon.
 
-**For lenders:** Supply USDC to the lending pool and earn yield generated from borrower interest payments. Receive pUSDC — ERC-4626 vault shares that automatically accrue interest over time.
+**For lenders:** Supply USDC to the lending pool and earn yield from borrower interest and profit fees. Receive pUSDC — ERC-4626 vault shares that automatically accrue value over time.
 
 ---
 
@@ -42,17 +42,20 @@ The protocol is split across two contracts that share a single proxy address:
 - **Collateral Manager** — tracks per-user, per-token ERC-1155 collateral deposits and loan positions
 - **Meta-Transaction Relayer** — all borrow, withdraw, and leverage operations use EIP-712 signed intents submitted by a trusted relayer, eliminating the need for users to hold gas tokens
 - **Leverage Engine** — users sign a single `LeverageAuth` message authorizing a maximum borrow budget. Two paths: (1) single-step via `pullUsdcForLeverage` — pulls user USDC + pool advance to the relayer, one CLOB buy, one `leverageDeposit` to formalize debt; (2) multi-step via iterative `leverageDeposit` calls — deposit shares → borrow USDC → CLOB buy → repeat until target leverage. Both paths are bounded by the user-signed `maxBorrow` budget
-- **Deleverage Engine** — `deleverageStep()` enables iterative repay-and-withdraw loops: users sign a single `DeleverageAuth` message authorizing a maximum withdrawal budget, and the relayer executes multiple steps. Repayment happens first (improving health factor), then collateral withdrawal — ensuring the position stays healthy throughout unwinding
-- **Interest Rate Model** — kinked utilization-based curve: low rates at low utilization, sharply rising rates above the kink to incentivize liquidity
+- **Flash Close Engine** — `initiateClose()` + `settleClose()` enable single-signature position closing: user signs a `CloseAuth`, the relayer zeros debt, transfers all shares to itself, sells on CLOB, and settles with proceeds. Profit fees are deducted automatically during settlement
+- **Interest Rate Model** — kinked utilization-based curve: 10% base APR at zero utilization, rising to 42% at 80% utilization (kink), then sharply to 317% max to incentivize liquidity
+- **Profit Fee** — 10% fee on borrower profit at position close, split 7% to the lending pool (increases lender yield) and 3% to the protocol. Only charged when the borrower's surplus exceeds their initial equity investment
 - **Dynamic LTV Curve** — 7-anchor price interpolation that adjusts the loan-to-value ratio based on current collateral price; shares closer to $1.00 receive higher LTV
 - **Oracle Verifier** — validates cryptographically signed, timestamp-bounded price data; rejects data older than 10 seconds
-- **Liquidation Engine** — allows the relayer to repay unhealthy positions and seize collateral
+- **Liquidation Engine** — full collateral seizure model: when a position's health factor drops below 1.0, the liquidator seizes all collateral and sells it on the CLOB. Settlement distributes proceeds: pool recovers debt, liquidator receives a 5% fee on the debt amount, and any remaining surplus stays in the pool. No upfront USDC required from the liquidator
 - **Timelock Governance** — sensitive parameter changes (oracle, relayer, risk model, upgrades) require a mandatory waiting period before taking effect; the delay is a one-way ratchet (can only increase)
 
-**`PredmartPoolExtension`** — admin governance and market resolution, called via `delegatecall` from the main contract's `fallback()`:
+**`PredmartPoolExtension`** — admin governance, market resolution, and liquidation settlement, called via `delegatecall` from the main contract's `fallback()`:
 
 - **Timelocked Admin Functions** — propose/execute changes to oracle, relayer, risk anchors, and contract upgrades
 - **Market Resolution** — permissionless functions to resolve Polymarket markets, close positions on resolved markets, redeem winning CTF shares for USDC, and settle borrower positions with pro-rata surplus distribution
+- **Liquidation Settlement** — `settleLiquidation()` processes CLOB sale proceeds after collateral seizure, distributing debt repayment, liquidator fee, and handling bad debt absorption
+- **Fee Management** — `withdrawOperationFees()` and `withdrawFeeShares()` callable by both admin and relayer for automated gas top-up; `withdrawProtocolFees()` for admin to collect protocol's profit fee share
 - **Inline Helpers** — duplicates of internal interest accrual and borrow tracking functions (required because the extension cannot call the main contract's `internal` functions via delegatecall)
 
 Both contracts share an identical storage layout to ensure safe delegatecall execution.
@@ -68,7 +71,7 @@ Users never submit transactions directly. Instead, they sign EIP-712 typed data 
 - **BorrowIntent** — signed by the borrower, specifies amount, token, and destination
 - **WithdrawIntent** — signed by the borrower, specifies amount, token, and withdrawal destination
 - **LeverageAuth** — signed once per leverage operation, authorizes a cumulative borrow budget with an explicit `allowedFrom` address (user's Gnosis Safe) where USDC is sent
-- **DeleverageAuth** — signed once per deleverage operation, authorizes a cumulative withdrawal budget with an explicit `allowedTo` address (user's Gnosis Safe) where collateral is returned
+- **CloseAuth** — signed once per flash close or TP/SL order, authorizes the relayer to close a specific position and settle with CLOB sale proceeds
 
 ### Upgradeability
 
@@ -82,9 +85,10 @@ The contract uses the **UUPS (Universal Upgradeable Proxy Standard)** pattern. T
 predmart-contracts/
 ├── src/
 │   ├── PredmartLendingPool.sol     # Core lending pool (ERC-4626 + collateral + leverage + liquidation)
-│   ├── PredmartPoolExtension.sol   # Admin governance + market resolution (called via delegatecall)
-│   ├── PredmartPoolLib.sol         # Interest rate model + liquidation math
+│   ├── PredmartPoolExtension.sol   # Admin governance + market resolution + liquidation settlement
+│   ├── PredmartPoolLib.sol         # Interest rate model + liquidation math + profit fee calc
 │   ├── PredmartOracle.sol          # Oracle signature verification helpers
+│   ├── PredmartTypes.sol           # Shared structs (Position, PendingClose, PendingLiquidation)
 │   └── interfaces/
 │       └── ICTF.sol                # Interface for Polymarket's CTF ERC-1155 contract
 ├── test/
@@ -200,6 +204,14 @@ The `proposeUpgrade` script deploys both a new `PredmartLendingPool` implementat
 | LTV curve anchors | 7 price points |
 | Per-token borrow cap | 5% of pool |
 | Upgrade pattern | UUPS (ERC-1967) with timelock |
+| Base borrow APR | 10% |
+| Max borrow APR | 317% (at 100% utilization) |
+| Rate at kink (80% utilization) | 42% |
+| Reserve factor | 10% of interest to protocol reserves |
+| Profit fee | 10% of borrower profit (7% to pool, 3% to protocol) |
+| Liquidation model | Full collateral seizure |
+| Liquidator fee | 5% of debt amount |
+| Operation fee | $0.03 per relayed operation |
 
 ---
 
@@ -219,7 +231,7 @@ Managed as git submodules via Foundry:
 ## Security
 
 - **Non-custodial:** All funds are held by the smart contract. PredMart (the team) cannot access or move user funds. Leverage operations send borrowed USDC to the user's own Gnosis Safe, not to the relayer or any admin wallet.
-- **EIP-712 signature verification:** Every relay operation (borrow, withdraw, leverage) requires a cryptographic signature from the user. The relayer cannot modify fund destinations — all recipient addresses are part of the signed message.
+- **EIP-712 signature verification:** Every relay operation (borrow, withdraw, leverage, close) requires a cryptographic signature from the user. The relayer cannot modify fund destinations — all recipient addresses are part of the signed message.
 - **Cumulative borrow budgets:** Leverage operations enforce a user-signed maximum borrow amount. The contract tracks cumulative borrowing per authorization, preventing the relayer from exceeding the user's intent across multiple steps.
 - **Oracle signature verification:** All price data is signed by an authorized oracle key and verified on-chain with a 10-second freshness requirement.
 - **Timelock governance:** Sensitive parameter changes (oracle address, relayer address, risk parameters, contract upgrades) require a mandatory waiting period before taking effect. The timelock delay is a one-way ratchet — it can only be increased, never decreased.
@@ -227,7 +239,9 @@ Managed as git submodules via Foundry:
 - **Depth-gated borrow caps:** Maximum borrowable amount per token is capped by that token's orderbook liquidity on Polymarket, preventing concentration in illiquid markets.
 - **Emergency pause:** Admin can pause the protocol instantly. Pausing blocks new borrows, deposits, and leverage — but repayments, withdrawals, and liquidations remain open so users can exit.
 - **Price drop guard:** New borrows are automatically blocked during rapid collateral price crashes.
-- **Replay protection:** Separate nonce sequences for borrow, withdraw, leverage, and deleverage operations prevent cross-operation replay attacks.
+- **Replay protection:** Separate nonce sequences for borrow, withdraw, leverage, and close operations prevent cross-operation replay attacks.
+- **Profit fee fairness:** Profit fees are only charged when a borrower's surplus exceeds their tracked initial equity investment. Legacy positions (pre-v2) with no recorded equity are exempt.
+- **Zero-USDC liquidation:** Liquidators don't need upfront USDC — they seize collateral first, sell on the market, then settle. This eliminates capital requirements and fund-mixing risks.
 
 For a full security breakdown, see the [Security documentation](https://predmart.com/docs/security).
 
