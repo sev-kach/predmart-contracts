@@ -715,8 +715,8 @@ contract PredmartLendingPoolTest is Test {
         vm.stopPrank();
 
 
-        // Create price data with old timestamp (11 seconds ago, exceeds MAX_RELAY_PRICE_AGE of 10 seconds)
-        PredmartOracle.PriceData memory stalePrice = _signPriceAt(TOKEN_ID_YES, 0.80e18, block.timestamp - 11 seconds);
+        // Create price data with old timestamp (61 seconds ago, exceeds MAX_RELAY_PRICE_AGE of 60 seconds)
+        PredmartOracle.PriceData memory stalePrice = _signPriceAt(TOKEN_ID_YES, 0.80e18, block.timestamp - 61 seconds);
 
         uint256 nonce = pool.borrowNonces(borrower);
         uint256 deadline = block.timestamp + 300;

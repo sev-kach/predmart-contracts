@@ -42,7 +42,7 @@ contract PredmartLendingPool is
 
     string public constant VERSION = "2.0.0";
 
-    uint256 public constant MAX_RELAY_PRICE_AGE = 10 seconds;
+    uint256 public constant MAX_RELAY_PRICE_AGE = 60 seconds;
     uint256 public constant NUM_ANCHORS = 7;
     uint256 public constant MIN_BORROW = 1e6; // $1 USDC minimum debt
     uint256 public constant CLOSE_TIMEOUT = 1 hours; // Max duration for pending flash close settlement
@@ -246,6 +246,9 @@ contract PredmartLendingPool is
     // v2.0.0 — Separate liquidator wallet (can call liquidate + settleLiquidation)
     address public liquidator;
 
+    // v2.1.0 — Advance timestamps for permissionless expiry
+    mapping(bytes32 => uint256) public pendingAdvanceTimestamps;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -312,10 +315,11 @@ contract PredmartLendingPool is
         extension = _extension;
     }
 
-    /// @notice Initialize v2.0.0 — update extension for v2 (profit fees, full seizure liquidation)
-    function initializeV13(address _extension, address _liquidator) public reinitializer(13) {
+    // initializeV13 removed — already executed, reinitializer prevents reuse
+
+    /// @notice Initialize v2.0.1 — update extension (60s maxAge for liquidation)
+    function initializeV14(address _extension) public reinitializer(14) {
         extension = _extension;
-        liquidator = _liquidator;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -697,6 +701,7 @@ contract PredmartLendingPool is
                 uint256 settled = advance > borrowAmount ? borrowAmount : advance;
                 pendingAdvances[authHash] = advance - settled;
                 totalPendingAdvances -= settled;
+                if (pendingAdvances[authHash] == 0) delete pendingAdvanceTimestamps[authHash];
                 _advanceOffset = settled;
             }
 

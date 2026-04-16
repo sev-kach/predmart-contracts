@@ -165,6 +165,9 @@ contract PredmartPoolExtension {
     // v2.0.0 — Separate liquidator wallet (can call liquidate + settleLiquidation)
     address public liquidator;
 
+    // v2.1.0 — Advance timestamps for permissionless expiry
+    mapping(bytes32 => uint256) public pendingAdvanceTimestamps;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -585,7 +588,7 @@ contract PredmartPoolExtension {
         MarketResolution memory resolution = resolvedMarkets[tokenId];
         if (resolution.resolved && !resolution.won) revert MarketResolved();
         if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
-        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), 10 seconds);
+        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), 60 seconds);
 
         _accrueInterestInline();
 
@@ -760,15 +763,19 @@ contract PredmartPoolExtension {
 
     event AdvanceExpired(bytes32 indexed authHash, uint256 amount);
 
-    /// @notice Clear a stuck pending advance after admin recovery of USDC from relayer.
-    /// @dev Admin-only. Use when the relayer received an advance but never called leverageDeposit.
-    ///      The admin must first recover the USDC from the relayer wallet (manual transfer),
-    ///      then call this to clear the on-chain accounting.
-    function expireAdvance(bytes32 authHash) external onlyAdmin {
+    /// @notice Expire a stuck pending advance. Permissionless after CLOSE_TIMEOUT; admin can expire immediately.
+    /// @dev When the relayer received an advance but never called leverageDeposit, the advance
+    ///      sits in the relayer wallet. After timeout, anyone can expire it (bad debt socialized).
+    ///      Admin should recover USDC from relayer first to avoid pool loss.
+    function expireAdvance(bytes32 authHash) external {
         uint256 amount = pendingAdvances[authHash];
         if (amount == 0) revert NoPendingAdvance();
+        if (msg.sender != admin) {
+            if (block.timestamp < pendingAdvanceTimestamps[authHash] + 1 hours) revert TooEarly();
+        }
         pendingAdvances[authHash] = 0;
         totalPendingAdvances -= amount;
+        delete pendingAdvanceTimestamps[authHash];
         emit AdvanceExpired(authHash, amount);
     }
 
@@ -885,6 +892,7 @@ contract PredmartPoolExtension {
 
             pendingAdvances[authHash] += netAdvance;
             totalPendingAdvances += netAdvance;
+            pendingAdvanceTimestamps[authHash] = block.timestamp;
             IERC20(_asset()).safeTransfer(msg.sender, netAdvance);
             emit PoolAdvancedForLeverage(auth.borrower, netAdvance, auth.tokenId);
         }
