@@ -45,7 +45,7 @@ contract PredmartLendingPool is
     uint256 public constant MAX_RELAY_PRICE_AGE = 60 seconds;
     uint256 public constant NUM_ANCHORS = 7;
     uint256 public constant MIN_BORROW = 1e6; // $1 USDC minimum debt
-    uint256 public constant CLOSE_TIMEOUT = 1 hours; // Max duration for pending flash close settlement
+    uint256 public constant CLOSE_TIMEOUT = 48 hours; // Max duration for pending flash close settlement
 
     // EIP-712 typehashes for meta-transaction intents
     bytes32 public constant BORROW_INTENT_TYPEHASH = keccak256(
@@ -125,10 +125,10 @@ contract PredmartLendingPool is
         uint256 deadline;
     }
 
-    /// @notice EIP-712 authorization for a leverage loop (signed once, reusable within budget)
+    /// @notice EIP-712 authorization for a leverage operation (signed once, reusable within budget)
     struct LeverageAuth {
         address borrower;
-        address allowedFrom; // Permitted source for CTF shares (user's Safe for first loop, relayer always allowed via msg.sender)
+        address allowedFrom; // Permitted source for CTF shares (user's Safe or relayer, always allowed via msg.sender)
         uint256 tokenId;
         uint256 maxBorrow; // Max cumulative USDC the relayer can borrow under this auth (6 decimals)
         uint256 nonce;
@@ -210,7 +210,7 @@ contract PredmartLendingPool is
     address public pendingAdmin; // v0.9.1 — timelocked admin transfer
     uint256 public pendingAdminExecAfter;
 
-    // v1.0.0 — Leverage loop authorization
+    // v1.0.0 — Leverage authorization
     mapping(address => uint256) public leverageNonces; // Separate nonce for leverage (doesn't interfere with borrow/withdraw nonces)
     mapping(bytes32 => uint256) public leverageBorrowUsed; // authHash => cumulative USDC borrowed under this auth
 
@@ -228,7 +228,7 @@ contract PredmartLendingPool is
     uint256 public operationFeePool; // Accumulated USDC fees dedicated to relayer gas top-up
     mapping(uint256 => uint256) public feeSharesAccumulated; // tokenId => CTF shares collected as withdrawal fees
 
-    // v1.5.0 — Single-step leverage: pool advances borrow USDC to relayer before collateral is deposited
+    // v1.5.0 — Leverage advance: pool advances borrow USDC to relayer before collateral is deposited
     mapping(bytes32 => uint256) public pendingAdvances; // authHash => USDC advanced to relayer
     uint256 public totalPendingAdvances; // Global sum for liquidity monitoring
     uint256 private _advanceOffset; // Transient: used to pass advance offset to _executeBorrow
@@ -248,6 +248,10 @@ contract PredmartLendingPool is
 
     // v2.1.0 — Advance timestamps for permissionless expiry
     mapping(bytes32 => uint256) public pendingAdvanceTimestamps;
+
+    // v2.2.0 — Timelocked liquidator rotation
+    address public pendingLiquidator;
+    uint256 public pendingLiquidatorExecAfter;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -481,8 +485,10 @@ contract PredmartLendingPool is
     /// @notice Deposit ERC-1155 prediction market shares as collateral (from msg.sender)
     /// @param tokenId Polymarket CTF token ID
     /// @param amount Number of shares to deposit
-    function depositCollateral(uint256 tokenId, uint256 amount) external nonReentrant whenNotPaused {
+    /// @param priceData Signed oracle price — used to track initialEquity for accurate profit fee
+    function depositCollateral(uint256 tokenId, uint256 amount, PredmartOracle.PriceData calldata priceData) external nonReentrant whenNotPaused {
         _depositCollateral(msg.sender, msg.sender, tokenId, amount);
+        _trackDepositEquity(msg.sender, tokenId, amount, priceData);
     }
 
     /// @notice Deposit collateral from a different address (e.g. Polymarket Safe proxy).
@@ -491,7 +497,8 @@ contract PredmartLendingPool is
     /// @param from Address holding the CTF shares (e.g. user's Gnosis Safe)
     /// @param tokenId Polymarket CTF token ID
     /// @param amount Number of shares to deposit
-    function depositCollateralFrom(address from, uint256 tokenId, uint256 amount) external nonReentrant whenNotPaused {
+    /// @param priceData Signed oracle price — used to track initialEquity for accurate profit fee
+    function depositCollateralFrom(address from, uint256 tokenId, uint256 amount, PredmartOracle.PriceData calldata priceData) external nonReentrant whenNotPaused {
         if (msg.sender != from) {
             (bool ok, bytes memory data) = from.staticcall(
                 abi.encodeWithSignature("isOwner(address)", msg.sender)
@@ -499,6 +506,15 @@ contract PredmartLendingPool is
             if (!ok || data.length < 32 || !abi.decode(data, (bool))) revert NotProxyOwner();
         }
         _depositCollateral(msg.sender, from, tokenId, amount);
+        _trackDepositEquity(msg.sender, tokenId, amount, priceData);
+    }
+
+    /// @dev Track user's own capital for profit fee calculation on direct deposits.
+    ///      NOT called from leverageDeposit — those shares are bought with borrowed money.
+    function _trackDepositEquity(address creditTo, uint256 tokenId, uint256 amount, PredmartOracle.PriceData calldata priceData) internal {
+        if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
+        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
+        positions[creditTo][tokenId].initialEquity += amount * price / 1e18;
     }
 
     /// @dev Internal deposit: transfers CTF shares from `from` and credits the position to `creditTo`.
@@ -636,25 +652,23 @@ contract PredmartLendingPool is
         _executeBorrow(intent.borrower, intent.tokenId, intent.amount, price, priceData.maxBorrow, intent.borrower, true);
     }
 
-    /// @notice Execute one step of a leverage operation: deposit collateral + borrow USDC.
+    /// @notice Deposit collateral + formalize borrow for a leverage operation.
     /// @dev Only callable by the relayer. User must sign a LeverageAuth EIP-712 message authorizing
     ///      a maximum borrow budget. The contract verifies the signature and tracks cumulative borrowing
     ///      against the budget. The auth is consumed (nonce incremented) on first use and expires at deadline.
-    ///      Used in both single-step leverage (after pullUsdcForLeverage) and multi-step loops.
-    ///      In single-step: called once to deposit all shares + formalize the pool advance as debt.
-    ///      In multi-step: called iteratively (deposit → borrow → CLOB buy → deposit → borrow → ...).
+    ///      Typical flow: pullUsdcForLeverage() advances pool USDC to relayer → relayer buys shares on
+    ///      CLOB → leverageDeposit() deposits all shares and formalizes the advance as real debt.
     ///
     ///      NONCE DESIGN (LC-02): Nonce is consumed on first borrow, NOT on deposit-only calls.
-    ///      This is intentional. In a multi-step loop (deposit → borrow → deposit → borrow),
-    ///      If the nonce were consumed on the first deposit-only step, the auth (signed with nonce N)
-    ///      would be bricked — subsequent steps would fail because the contract expects nonce N+1.
-    ///      Deposit-only replay is harmless: it only adds collateral (improving the borrower's HF).
-    ///      The borrow budget (maxBorrow) prevents unbounded borrowing under a single auth.
+    ///      Deposit-only calls (borrowAmount=0) are used to add pre-existing Safe shares as collateral
+    ///      before the main deposit+borrow call. These are harmless replays — they only add collateral
+    ///      (improving the borrower's HF). The borrow budget (maxBorrow) prevents unbounded borrowing
+    ///      under a single auth.
     /// @param auth The user's leverage authorization (tokenId, maxBorrow budget, nonce, deadline)
     /// @param authSignature The user's EIP-712 signature of the LeverageAuth
-    /// @param from Address holding CTF shares (user's Safe for first loop, relayer for subsequent loops)
+    /// @param from Address holding CTF shares (user's Safe or relayer)
     /// @param depositAmount Number of CTF shares to deposit as collateral (0 to skip deposit)
-    /// @param borrowAmount USDC amount to borrow in this step (6 decimals, 0 to skip borrow)
+    /// @param borrowAmount USDC amount to borrow (6 decimals, 0 to skip borrow)
     /// @param priceData Signed oracle price data (required when borrowAmount > 0)
     function leverageDeposit(
         LeverageAuth calldata auth,
@@ -719,80 +733,8 @@ contract PredmartLendingPool is
         }
     }
 
-    /*//////////////////////////////////////////////////////////////
-                     POOL-FUNDED FLASH CLOSE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Close an entire position in a single transaction. Pool absorbs the debt gap temporarily.
-    /// @dev Flow: zero debt → send all collateral to relayer → relayer sells on CLOB → settleClose().
-    ///      Shares go to msg.sender (relayer), NOT auth.allowedTo. This prevents the user from
-    ///      receiving collateral and disappearing before repaying the pool.
-    ///      Unhealthy positions (HF < 1.0) must use the liquidation flow, not flash close.
-    ///      TRUST MODEL: The relayer is trusted to sell collateral honestly and call settleClose
-    ///      with accurate saleProceeds. Relayer rotation is timelocked (6h) to allow detection.
-    /// @param auth The user's close authorization (borrower, allowedTo for surplus, tokenId, nonce, deadline)
-    /// @param authSignature The user's EIP-712 signature of the CloseAuth
-    /// @param priceData Signed oracle price data
-    function initiateClose(
-        CloseAuth calldata auth,
-        bytes calldata authSignature,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant whenNotPaused {
-        if (auth.allowedTo == address(0)) revert InvalidAddress();
-        if (msg.sender != relayer) revert NotRelayer();
-        if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
-        if (block.timestamp > auth.deadline) revert IntentExpired();
-        if (auth.nonce != closeNonces[auth.borrower][auth.tokenId]) revert InvalidNonce();
-
-        // Verify EIP-712 signature
-        bytes32 structHash = keccak256(abi.encode(
-            CLOSE_AUTH_TYPEHASH, auth.borrower, auth.allowedTo, auth.tokenId, auth.nonce, auth.deadline
-        ));
-        address signer = ECDSA.recover(_hashTypedDataV4(structHash), authSignature);
-        if (signer != auth.borrower) revert InvalidIntentSignature();
-
-        // Consume nonce
-        closeNonces[auth.borrower][auth.tokenId]++;
-
-        // Block double close
-        if (pendingCloses[auth.borrower][auth.tokenId].deadline != 0) revert PositionHasPendingClose();
-
-        _accrueInterest();
-
-        Position storage pos = positions[auth.borrower][auth.tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-        if (pos.borrowShares == 0) revert NoPosition(); // No debt — use withdrawViaRelay instead
-
-        uint256 collateralAmount = pos.collateralAmount;
-
-        // Verify price and health
-        uint256 price = _verifyPriceFor(auth.tokenId, priceData);
-        uint256 debt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-        if (_getHealthFactor(collateralAmount, debt, price) < 1e18) revert PositionUnhealthy();
-
-        // Zero the borrow
-        uint256 principal = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : debt;
-        _reduceBorrowTracking(auth.tokenId, debt, pos.borrowShares, principal);
-        pos.borrowShares = 0;
-        pos.borrowedPrincipal = 0;
-
-        // Record pending close — pool absorbs the gap until settlement
-        pendingCloses[auth.borrower][auth.tokenId] = PendingClose({
-            surplusRecipient: auth.allowedTo,
-            debtAmount: debt,
-            collateralAmount: collateralAmount,
-            deadline: block.timestamp + CLOSE_TIMEOUT,
-            initialEquity: pos.initialEquity
-        });
-        totalPendingCloses += debt;
-
-        // Withdraw all collateral to relayer (msg.sender) for CLOB sale
-        pos.collateralAmount = 0;
-        delete positions[auth.borrower][auth.tokenId];
-        ICTF(ctf).safeTransferFrom(address(this), msg.sender, auth.tokenId, collateralAmount, "");
-
-        emit PositionCloseInitiated(auth.borrower, auth.tokenId, debt, collateralAmount);
-    }
+    // initiateClose moved to PredmartPoolExtension (EIP-170 size limit).
+    // Called via fallback delegatecall — same function selector, transparent to callers.
 
     /// @dev Core borrow execution — shared by borrowViaRelay (USDC→EOA) and leverageDeposit (USDC→Safe).
     ///      Caller must call _accrueInterest() before this function.

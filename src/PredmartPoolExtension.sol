@@ -14,7 +14,8 @@ import { INegRiskAdapter } from "./interfaces/INegRiskAdapter.sol";
 import {
     Position, MarketResolution, Redemption, PendingClose, PendingLiquidation,
     NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NoPendingLiquidation, NotLiquidator,
-    BadDebtAbsorbed, InterestAccrued, OperationFeeCollected, OperationFeeUpdated, LiquidationSettled, ProfitFeeCollected
+    BadDebtAbsorbed, InterestAccrued, OperationFeeCollected, OperationFeeUpdated, LiquidationSettled, ProfitFeeCollected,
+    PositionCloseInitiated
 } from "./PredmartTypes.sol";
 
 /// @title PredmartPoolExtension
@@ -35,6 +36,11 @@ contract PredmartPoolExtension {
     uint256 public constant NUM_ANCHORS = 7;
     uint256 public constant MAX_RESOLUTION_AGE = 1 hours;
     uint256 public constant MAX_OPERATION_FEE = 100_000; // $0.10 USDC maximum
+    uint256 public constant CLOSE_TIMEOUT = 48 hours;
+    uint256 public constant MAX_RELAY_PRICE_AGE = 60 seconds;
+    bytes32 public constant CLOSE_AUTH_TYPEHASH = keccak256(
+        "CloseAuth(address borrower,address allowedTo,uint256 tokenId,uint256 nonce,uint256 deadline)"
+    );
 
     /*//////////////////////////////////////////////////////////////
                               ERRORS
@@ -56,6 +62,8 @@ contract PredmartPoolExtension {
     error MarketResolved();
     error AdvanceTooSmall();
     error PositionHealthy();
+    error PositionUnhealthy();
+    error PositionHasPendingClose();
     error ProtocolPaused();
     error TooEarly();
 
@@ -147,7 +155,7 @@ contract PredmartPoolExtension {
     uint256 public operationFeePool;
     mapping(uint256 => uint256) public feeSharesAccumulated;
 
-    // v1.5.0 — Single-step leverage (must match PredmartLendingPool storage layout)
+    // v1.5.0 — Leverage advance (must match PredmartLendingPool storage layout)
     mapping(bytes32 => uint256) public pendingAdvances;
     uint256 public totalPendingAdvances;
     uint256 private _advanceOffset;
@@ -167,6 +175,10 @@ contract PredmartPoolExtension {
 
     // v2.1.0 — Advance timestamps for permissionless expiry
     mapping(bytes32 => uint256) public pendingAdvanceTimestamps;
+
+    // v2.2.0 — Timelocked liquidator rotation
+    address public pendingLiquidator;
+    uint256 public pendingLiquidatorExecAfter;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -223,8 +235,15 @@ contract PredmartPoolExtension {
         emit TokenFrozenEvent(tokenId, frozen);
     }
 
-    /// @notice Pause or unpause the protocol
-    function setPaused(bool _paused) external onlyAdmin {
+    /// @notice Pause or unpause the protocol.
+    /// Pause: callable by admin or relayer (emergency brake).
+    /// Unpause: admin only.
+    function setPaused(bool _paused) external {
+        if (_paused) {
+            if (msg.sender != admin && msg.sender != relayer) revert NotAdmin();
+        } else {
+            if (msg.sender != admin) revert NotAdmin();
+        }
         paused = _paused;
         emit PausedStateChanged(_paused);
     }
@@ -235,13 +254,18 @@ contract PredmartPoolExtension {
         emit PoolCapUpdated(newCapBps);
     }
 
-    event LiquidatorUpdated(address indexed newLiquidator);
+    event LiquidatorUpdated(address indexed oldLiquidator, address indexed newLiquidator);
+    event LiquidatorChangeProposed(address indexed proposed, uint256 execAfter);
+    event LiquidatorChangeCancelled();
 
-    /// @notice Set the dedicated liquidator wallet address (instant, no timelock)
+    /// @notice Set the dedicated liquidator wallet address.
+    ///         Instant only if no liquidator is set yet (first-time setup).
+    ///         Otherwise timelocked — use proposeAddress(3, addr) + executeAddress(3).
     function setLiquidator(address _liquidator) external onlyAdmin {
         if (_liquidator == address(0)) revert InvalidAddress();
+        if (timelockDelay > 0 && liquidator != address(0)) revert TimelockNotReady();
+        emit LiquidatorUpdated(liquidator, _liquidator);
         liquidator = _liquidator;
-        emit LiquidatorUpdated(_liquidator);
     }
 
     /// @notice Set the operation fee for relayed transactions (instant, no timelock)
@@ -300,16 +324,18 @@ contract PredmartPoolExtension {
                   ADMIN — TIMELOCKED (dangerous operations)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Propose a timelocked address change. kind: 0=oracle, 1=relayer, 2=upgrade
+    /// @notice Propose a timelocked address change. kind: 0=oracle, 1=relayer, 2=upgrade, 3=liquidator
     function proposeAddress(uint8 kind, address addr) external onlyAdmin {
         if (addr == address(0)) revert InvalidAddress();
         uint256 execAfter = block.timestamp + timelockDelay;
         if (kind == 0) { pendingOracle = addr; pendingOracleExecAfter = execAfter; emit OracleChangeProposed(addr, execAfter); }
         else if (kind == 1) { pendingRelayer = addr; pendingRelayerExecAfter = execAfter; emit RelayerChangeProposed(addr, execAfter); }
-        else { pendingUpgrade = addr; pendingUpgradeExecAfter = execAfter; emit UpgradeProposed(addr, execAfter); }
+        else if (kind == 2) { pendingUpgrade = addr; pendingUpgradeExecAfter = execAfter; emit UpgradeProposed(addr, execAfter); }
+        else if (kind == 3) { pendingLiquidator = addr; pendingLiquidatorExecAfter = execAfter; emit LiquidatorChangeProposed(addr, execAfter); }
+        else { revert InvalidAddress(); }
     }
 
-    /// @notice Execute a timelocked address change. kind: 0=oracle, 1=relayer
+    /// @notice Execute a timelocked address change. kind: 0=oracle, 1=relayer, 3=liquidator
     function executeAddress(uint8 kind) external onlyAdmin {
         if (kind == 0) {
             if (pendingOracle == address(0)) revert NoPendingChange();
@@ -317,12 +343,20 @@ contract PredmartPoolExtension {
             emit OracleUpdated(oracle, pendingOracle);
             oracle = pendingOracle;
             delete pendingOracle; delete pendingOracleExecAfter;
-        } else {
+        } else if (kind == 1) {
             if (pendingRelayer == address(0)) revert NoPendingChange();
             if (block.timestamp < pendingRelayerExecAfter) revert TimelockNotReady();
             emit RelayerUpdated(relayer, pendingRelayer);
             relayer = pendingRelayer;
             delete pendingRelayer; delete pendingRelayerExecAfter;
+        } else if (kind == 3) {
+            if (pendingLiquidator == address(0)) revert NoPendingChange();
+            if (block.timestamp < pendingLiquidatorExecAfter) revert TimelockNotReady();
+            emit LiquidatorUpdated(liquidator, pendingLiquidator);
+            liquidator = pendingLiquidator;
+            delete pendingLiquidator; delete pendingLiquidatorExecAfter;
+        } else {
+            revert NoPendingChange();
         }
     }
 
@@ -354,12 +388,13 @@ contract PredmartPoolExtension {
         emit AnchorsUpdated();
     }
 
-    /// @notice Cancel a pending timelocked change. kind: 0=oracle, 1=relayer, 2=upgrade, 3=anchors
+    /// @notice Cancel a pending timelocked change. kind: 0=oracle, 1=relayer, 2=upgrade, 3=liquidator, 4=anchors
     function cancelPending(uint8 kind) external onlyAdmin {
         if (kind == 0) { delete pendingOracle; delete pendingOracleExecAfter; emit OracleChangeCancelled(); }
         else if (kind == 1) { delete pendingRelayer; delete pendingRelayerExecAfter; }
         else if (kind == 2) { delete pendingUpgrade; delete pendingUpgradeExecAfter; emit UpgradeCancelled(); }
-        else { delete pendingAnchorsExecAfter; emit AnchorsChangeCancelled(); }
+        else if (kind == 3) { delete pendingLiquidator; delete pendingLiquidatorExecAfter; emit LiquidatorChangeCancelled(); }
+        else if (kind == 4) { delete pendingAnchorsExecAfter; emit AnchorsChangeCancelled(); }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -672,7 +707,7 @@ contract PredmartPoolExtension {
     function expirePendingLiquidation(address borrower, uint256 tokenId) external {
         PendingLiquidation memory pending = pendingLiquidations[borrower][tokenId];
         if (pending.liquidator == address(0)) revert NoPendingLiquidation();
-        if (block.timestamp < pending.timestamp + 1 hours) revert TooEarly();
+        if (block.timestamp < pending.timestamp + 48 hours) revert TooEarly();
 
         totalPendingLiquidations = totalPendingLiquidations > pending.debt
             ? totalPendingLiquidations - pending.debt : 0;
@@ -682,8 +717,74 @@ contract PredmartPoolExtension {
     }
 
     /*//////////////////////////////////////////////////////////////
-                   POOL-FUNDED FLASH CLOSE — SETTLEMENT
+                   POOL-FUNDED FLASH CLOSE
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Close an entire position. Pool absorbs the debt gap temporarily.
+    /// @dev Moved from main contract to extension for EIP-170 size limit.
+    ///      Shares go to msg.sender (relayer) for CLOB sale. Relayer calls settleClose() after.
+    function initiateClose(
+        CloseAuth calldata auth,
+        bytes calldata authSignature,
+        PredmartOracle.PriceData calldata priceData
+    ) external {
+        if (paused) revert ProtocolPaused();
+        if (auth.allowedTo == address(0)) revert InvalidAddress();
+        if (msg.sender != relayer) revert NotRelayer();
+        if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
+        if (block.timestamp > auth.deadline) revert IntentExpired();
+        if (auth.nonce != closeNonces[auth.borrower][auth.tokenId]) revert InvalidNonce();
+
+        // Verify EIP-712 signature
+        bytes32 structHash = keccak256(abi.encode(
+            CLOSE_AUTH_TYPEHASH, auth.borrower, auth.allowedTo, auth.tokenId, auth.nonce, auth.deadline
+        ));
+        address signer = ECDSA.recover(_hashTypedDataV4Ext(structHash), authSignature);
+        if (signer != auth.borrower) revert InvalidIntentSignature();
+
+        // Consume nonce
+        closeNonces[auth.borrower][auth.tokenId]++;
+
+        // Block double close
+        if (pendingCloses[auth.borrower][auth.tokenId].deadline != 0) revert PositionHasPendingClose();
+
+        _accrueInterestInline();
+
+        Position storage pos = positions[auth.borrower][auth.tokenId];
+        if (pos.collateralAmount == 0) revert NoPosition();
+        if (pos.borrowShares == 0) revert NoPosition();
+
+        uint256 collateralAmount = pos.collateralAmount;
+
+        // Verify price and health
+        if (priceData.tokenId != auth.tokenId) revert PredmartOracle.TokenIdMismatch();
+        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
+        uint256 debt = _toBorrowAssetsInline(pos.borrowShares);
+        if (_getHealthFactorInline(collateralAmount, debt, price) < 1e18) revert PositionUnhealthy();
+
+        // Zero the borrow
+        uint256 principal = pos.borrowedPrincipal > 0 ? pos.borrowedPrincipal : debt;
+        _reduceBorrowTrackingInline(auth.tokenId, debt, pos.borrowShares, principal);
+        pos.borrowShares = 0;
+        pos.borrowedPrincipal = 0;
+
+        // Record pending close
+        pendingCloses[auth.borrower][auth.tokenId] = PendingClose({
+            surplusRecipient: auth.allowedTo,
+            debtAmount: debt,
+            collateralAmount: collateralAmount,
+            deadline: block.timestamp + CLOSE_TIMEOUT,
+            initialEquity: pos.initialEquity
+        });
+        totalPendingCloses += debt;
+
+        // Withdraw all collateral to relayer for CLOB sale
+        pos.collateralAmount = 0;
+        delete positions[auth.borrower][auth.tokenId];
+        ICTF(ctf).safeTransferFrom(address(this), msg.sender, auth.tokenId, collateralAmount, "");
+
+        emit PositionCloseInitiated(auth.borrower, auth.tokenId, debt, collateralAmount);
+    }
 
     /// @notice Settle a pending flash close after the relayer sold shares on CLOB.
     /// @dev Only callable by relayer. v2: deducts profit fee (10% of profit above initial equity).
@@ -771,7 +872,7 @@ contract PredmartPoolExtension {
         uint256 amount = pendingAdvances[authHash];
         if (amount == 0) revert NoPendingAdvance();
         if (msg.sender != admin) {
-            if (block.timestamp < pendingAdvanceTimestamps[authHash] + 1 hours) revert TooEarly();
+            if (block.timestamp < pendingAdvanceTimestamps[authHash] + 48 hours) revert TooEarly();
         }
         pendingAdvances[authHash] = 0;
         totalPendingAdvances -= amount;
@@ -814,6 +915,14 @@ contract PredmartPoolExtension {
         address allowedFrom;
         uint256 tokenId;
         uint256 maxBorrow;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    struct CloseAuth {
+        address borrower;
+        address allowedTo;
+        uint256 tokenId;
         uint256 nonce;
         uint256 deadline;
     }

@@ -101,7 +101,7 @@ contract Handler is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID, amount);
+        pool.depositCollateral(TOKEN_ID, amount, _signPrice(TOKEN_ID, PRICE));
         vm.stopPrank();
     }
 

@@ -266,7 +266,7 @@ contract PredmartLendingPoolTest is Test {
     ) internal {
         vm.startPrank(_borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(tokenId, collateralAmount);
+        pool.depositCollateral(tokenId, collateralAmount, _signPrice(tokenId, price));
         vm.stopPrank();
 
         uint256 nonce = pool.borrowNonces(_borrower);
@@ -351,7 +351,7 @@ contract PredmartLendingPoolTest is Test {
     function test_DepositCollateral() public {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -362,7 +362,7 @@ contract PredmartLendingPoolTest is Test {
     function test_WithdrawCollateral_NoDebt() public {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Withdraw via relay (no debt, so price verification is skipped)
@@ -430,7 +430,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -458,7 +458,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 10_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 10_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -648,7 +648,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         vm.expectRevert(PredmartLendingPool.MarketResolved.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -711,7 +711,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -739,7 +739,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -778,7 +778,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -850,7 +850,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -883,7 +883,7 @@ contract PredmartLendingPoolTest is Test {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
         vm.expectRevert(PredmartLendingPool.ProtocolPaused.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -1077,7 +1077,7 @@ contract PredmartLendingPoolTest is Test {
         // LTV at 0.80 = 70%, maxBorrow = 5000 * 0.80 * 0.70 = 2,800 — within LTV but exceeds cap.
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1197,7 +1197,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1223,7 +1223,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1248,7 +1248,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1273,7 +1273,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1299,7 +1299,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1572,7 +1572,7 @@ contract PredmartLendingPoolTest is Test {
         // Borrower deposits collateral first
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 3_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 3_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Relayer holds some CTF shares (simulating post-CLOB purchase)
@@ -1611,7 +1611,7 @@ contract PredmartLendingPoolTest is Test {
         // Borrower deposits some initial collateral
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Relayer has shares
@@ -1647,7 +1647,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1689,7 +1689,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1714,7 +1714,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1739,7 +1739,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1765,7 +1765,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1795,7 +1795,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Try to borrow $0.50 — below MIN_BORROW ($1)
@@ -1859,7 +1859,7 @@ contract PredmartLendingPoolTest is Test {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
         vm.expectRevert(PredmartLendingPool.TokenFrozen.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -1869,7 +1869,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit before freeze
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Freeze the token
@@ -1904,7 +1904,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit works after unfreeze
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -2036,12 +2036,12 @@ contract PredmartLendingPoolTest is Test {
         assertEq(collateral, 0);
         assertEq(shares, 0);
 
-        // Borrower received surplus (reduced by profit fee in v2)
-        // equity = collateralValue - debt = 4000 - 2000 = 2000, profit = 3000 - 2000 = 1000
-        // fee = 10% of 1000 = 100 → user receives ~2900
+        // Borrower received surplus — no profit fee because equity (4000) > surplus (3000)
+        // equity = 5000 * 0.80 = 4000 (tracked at deposit time), surplus = 5000 - ~2000 = ~3000
+        // profit = 0 (surplus < equity), user receives full surplus
         uint256 surplus = usdc.balanceOf(borrower) - borrowerBalBefore;
-        assertGt(surplus, 2_800e6, "Surplus: proceeds - debt - profit fee");
-        assertLt(surplus, 2_950e6);
+        assertGt(surplus, 2_950e6, "Full surplus - no profit fee");
+        assertLt(surplus, 3_050e6);
         assertEq(pool.unsettledRedemptions(), 0, "Unsettled cleared");
     }
 
@@ -2237,7 +2237,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateralFrom(borrower, TOKEN_ID_YES, 2_000e6);
+        pool.depositCollateralFrom(borrower, TOKEN_ID_YES, 2_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -2251,7 +2251,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.prank(borrower); // borrower is NOT an owner of fakeSafe
         vm.expectRevert(PredmartLendingPool.NotProxyOwner.selector);
-        pool.depositCollateralFrom(fakeSafe, TOKEN_ID_YES, 1_000e6);
+        pool.depositCollateralFrom(fakeSafe, TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2321,7 +2321,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Borrow
@@ -2388,13 +2388,13 @@ contract PredmartLendingPoolTest is Test {
         uint256 tokenId,
         uint256 price
     ) internal view returns (
-        PredmartLendingPool.CloseAuth memory auth,
+        PredmartPoolExtension.CloseAuth memory auth,
         bytes memory sig,
         PredmartOracle.PriceData memory priceData
     ) {
         uint256 nonce = pool.closeNonces(borrower, tokenId);
         uint256 deadline = block.timestamp + 300;
-        auth = PredmartLendingPool.CloseAuth({
+        auth = PredmartPoolExtension.CloseAuth({
             borrower: borrower,
             allowedTo: safe,
             tokenId: tokenId,
@@ -2417,14 +2417,14 @@ contract PredmartLendingPoolTest is Test {
         uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
 
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, price);
 
         // Flash close — relayer receives shares
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Position deleted
         (uint256 col, uint256 shares,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -2454,12 +2454,12 @@ contract PredmartLendingPoolTest is Test {
 
         // Flash close
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Simulate CLOB sale: relayer has USDC from selling shares
         uint256 saleProceeds = 790e6; // 1000 shares * 0.79 price (with slippage)
@@ -2489,12 +2489,12 @@ contract PredmartLendingPoolTest is Test {
 
         // Flash close
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Simulate partial CLOB sale — less than debt
         uint256 saleProceeds = 300e6;
@@ -2523,19 +2523,19 @@ contract PredmartLendingPoolTest is Test {
 
         // Flash close
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Try to expire before deadline — should fail
         vm.expectRevert(PredmartPoolExtension.CloseNotExpired.selector);
         poolAdmin.expirePendingClose(borrower, TOKEN_ID_YES);
 
-        // Warp past deadline (1 hour)
-        vm.warp(block.timestamp + 1 hours + 1);
+        // Warp past deadline (48 hours)
+        vm.warp(block.timestamp + 48 hours + 1);
 
         // Expire — permissionless, anyone can call
         address anyone = makeAddr("anyone");
@@ -2557,7 +2557,7 @@ contract PredmartLendingPoolTest is Test {
         uint256 lowPrice = 0.30e18;
 
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, lowPrice);
 
@@ -2565,7 +2565,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.expectRevert(PredmartLendingPool.PositionUnhealthy.selector);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, lowPriceData);
+        poolAdmin.initiateClose(auth, sig, lowPriceData);
     }
 
     function test_flashClose_revertDoubleClose() public {
@@ -2574,43 +2574,43 @@ contract PredmartLendingPoolTest is Test {
 
         // First close succeeds
         (
-            PredmartLendingPool.CloseAuth memory auth1,
+            PredmartPoolExtension.CloseAuth memory auth1,
             bytes memory sig1,
             PredmartOracle.PriceData memory priceData1
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth1, sig1, priceData1);
+        poolAdmin.initiateClose(auth1, sig1, priceData1);
 
         // Deposit during pending close should fail
         ctf.mint(borrower, TOKEN_ID_YES, 500e6);
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
         vm.expectRevert(PredmartLendingPool.PositionHasPendingClose.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 500e6);
+        pool.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Second close on same tokenId should also fail — pending close still exists
         (
-            PredmartLendingPool.CloseAuth memory auth2,
+            PredmartPoolExtension.CloseAuth memory auth2,
             bytes memory sig2,
             PredmartOracle.PriceData memory priceData2
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.expectRevert(PredmartLendingPool.PositionHasPendingClose.selector);
         vm.prank(relayer);
-        pool.initiateClose(auth2, sig2, priceData2);
+        poolAdmin.initiateClose(auth2, sig2, priceData2);
     }
 
     function test_flashClose_revertZeroDebtPosition() public {
         // Deposit collateral without borrowing
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 500e6);
+        pool.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Flash close on zero-debt position should revert (use withdrawViaRelay instead)
         uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
+        PredmartPoolExtension.CloseAuth memory auth = PredmartPoolExtension.CloseAuth({
             borrower: borrower,
             allowedTo: safe,
             tokenId: TOKEN_ID_YES,
@@ -2621,7 +2621,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.expectRevert(NoPosition.selector);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.initiateClose(auth, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_flashClose_revertWrongSigner() public {
@@ -2630,7 +2630,7 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
+        PredmartPoolExtension.CloseAuth memory auth = PredmartPoolExtension.CloseAuth({
             borrower: borrower,
             allowedTo: safe,
             tokenId: TOKEN_ID_YES,
@@ -2643,7 +2643,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
         vm.prank(relayer);
-        pool.initiateClose(auth, badSig, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.initiateClose(auth, badSig, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_flashClose_revertExpiredDeadline() public {
@@ -2652,7 +2652,7 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 nonce = pool.closeNonces(borrower, TOKEN_ID_YES);
         uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.CloseAuth memory auth = PredmartLendingPool.CloseAuth({
+        PredmartPoolExtension.CloseAuth memory auth = PredmartPoolExtension.CloseAuth({
             borrower: borrower,
             allowedTo: safe,
             tokenId: TOKEN_ID_YES,
@@ -2666,7 +2666,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.expectRevert(PredmartLendingPool.IntentExpired.selector);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.initiateClose(auth, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_flashClose_revertNotRelayer() public {
@@ -2674,7 +2674,7 @@ contract PredmartLendingPoolTest is Test {
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
@@ -2682,7 +2682,7 @@ contract PredmartLendingPoolTest is Test {
         // Call from non-relayer
         vm.expectRevert(NotRelayer.selector);
         vm.prank(borrower);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
     }
 
     function test_flashClose_totalAssetsInvariant() public {
@@ -2697,12 +2697,12 @@ contract PredmartLendingPoolTest is Test {
 
         // Close first position
         (
-            PredmartLendingPool.CloseAuth memory auth1,
+            PredmartPoolExtension.CloseAuth memory auth1,
             bytes memory sig1,
             PredmartOracle.PriceData memory priceData1
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth1, sig1, priceData1);
+        poolAdmin.initiateClose(auth1, sig1, priceData1);
 
         // totalAssets unchanged after close
         assertApproxEqAbs(pool.totalAssets(), totalAssetsBefore, 1, "Invariant after first close");
@@ -2735,12 +2735,12 @@ contract PredmartLendingPoolTest is Test {
 
         // Flash close
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Settle with zero proceeds (complete failure to sell)
         vm.prank(relayer);
@@ -2767,7 +2767,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit collateral
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 borrowerBalBefore = usdc.balanceOf(borrower);
@@ -2798,7 +2798,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 borrowerBalBefore = usdc.balanceOf(borrower);
@@ -2849,7 +2849,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit collateral, no borrow
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 withdrawAmt = 500e6;
@@ -2877,7 +2877,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6);
+        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Withdraw 1 share at $0.01 → fee = 3 shares > 1 share → entire withdrawal taken as fee
@@ -2937,12 +2937,12 @@ contract PredmartLendingPoolTest is Test {
         uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
 
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Sell at higher price to generate profit
         uint256 saleProceeds = 900e6; // 1000 shares * $0.90 → surplus = 500
@@ -2951,13 +2951,13 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolAdmin.settleClose(borrower, TOKEN_ID_YES, saleProceeds);
 
-        // surplus = 900 - 400 = 500, equity = 400, profit = 100
-        // profitFee = 10% of 100 = 10 (7 pool + 3 protocol)
-        // user receives = 500 - 10 = 490
+        // surplus = 900 - 400 = 500, equity = 800 (1000 shares * 0.80 at deposit time)
+        // profit = 0 (500 < 800 — surplus below initial equity), no fee charged
+        // user receives = 500 (full surplus)
         uint256 safeReceived = usdc.balanceOf(safe) - safeBalBefore;
-        uint256 expectedSurplus = saleProceeds - debt - 10e6;
-        assertEq(safeReceived, expectedSurplus, "Surplus reduced by profit fee");
-        assertEq(pool.protocolFeePool(), 3e6, "3% of profit to protocol");
+        uint256 expectedSurplus = saleProceeds - debt;
+        assertEq(safeReceived, expectedSurplus, "No profit fee - surplus below initial equity");
+        assertEq(pool.protocolFeePool(), 0, "No protocol fee when no profit");
     }
 
     function test_settleClose_feeSkippedIfProceedsTooLow() public {
@@ -2968,12 +2968,12 @@ contract PredmartLendingPoolTest is Test {
         uint256 feePoolBefore = pool.operationFeePool(); // 30000 from borrow
 
         (
-            PredmartLendingPool.CloseAuth memory auth,
+            PredmartPoolExtension.CloseAuth memory auth,
             bytes memory sig,
             PredmartOracle.PriceData memory priceData
         ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
         vm.prank(relayer);
-        pool.initiateClose(auth, sig, priceData);
+        poolAdmin.initiateClose(auth, sig, priceData);
 
         // Settle with proceeds less than fee ($0.02 < $0.03)
         vm.prank(relayer);
