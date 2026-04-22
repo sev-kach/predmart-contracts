@@ -263,10 +263,10 @@ contract PredmartLendingPool is
     address public pendingLiquidator;
     uint256 public pendingLiquidatorExecAfter;
 
-    // v2.3.0 — EIP-1271 signature auth for depositCollateralFrom (replaces isOwner check that allowed single-owner drain of multi-sig Safes — Hashlock H-01)
+    // v2.3.0 — EIP-1271 signature auth for depositCollateralFrom
     mapping(address => uint256) public depositCollateralFromNonces;
 
-    // v2.3.1 — Timelocked extension rotation (Hashlock L-01). Lives in main pool so extension swap works even if current extension is broken.
+    // v2.3.1 — Timelocked extension rotation. Lives in main pool so extension swap works even if current extension is broken.
     address public pendingExtension;
     uint256 public pendingExtensionExecAfter;
 
@@ -323,6 +323,16 @@ contract PredmartLendingPool is
     // initializeV5-V14 removed — already executed on mainnet, reinitializer prevents reuse.
     // V1-V4 retained because test/deploy scripts use them for fresh-proxy setup.
     // Future upgrades MUST add a fresh `initializeVN` with `reinitializer(N)` for any new state setup.
+
+    /// @notice Atomic extension rotation during UUPS upgrade.
+    /// @dev The reinitializer is callable only once via `upgradeToAndCall`, which is itself
+    ///      gated by the proposeAddress timelock — so this safely bypasses the setExtension
+    ///      timelock for a governance-approved upgrade.
+    function initializeV15(address _extension) public reinitializer(15) {
+        if (_extension == address(0)) revert InvalidAddress();
+        extension = _extension;
+        emit ExtensionUpdated(_extension);
+    }
 
     /*//////////////////////////////////////////////////////////////
                         GLOBAL INTEREST ACCRUAL
@@ -408,10 +418,10 @@ contract PredmartLendingPool is
     }
 
     /// @dev Available USDC in the contract excluding reserves, unsettled redemptions, and earmarked fees.
-    /// @dev M-02 FIX: `totalPendingAdvances` is NOT subtracted here. Advances have already left the
-    ///      pool's USDC balance when `pullUsdcForLeverage` transferred them to the relayer, so
-    ///      subtracting again would double-count. The pending advance is tracked separately for
-    ///      settlement/expiry bookkeeping, not as a claim on current cash.
+    ///      `totalPendingAdvances` is NOT subtracted here: advances have already left the pool's
+    ///      USDC balance when `pullUsdcForLeverage` transferred them to the relayer, so subtracting
+    ///      again would double-count. The pending advance is tracked separately for settlement/expiry
+    ///      bookkeeping, not as a claim on current cash.
     function _availableCash() internal view returns (uint256) {
         uint256 cash = IERC20(asset()).balanceOf(address(this));
         cash = cash > totalReserves ? cash - totalReserves : 0;
@@ -596,8 +606,8 @@ contract PredmartLendingPool is
         if (block.timestamp > intent.deadline) revert IntentExpired();
         if (intent.nonce != withdrawNonces[intent.borrower]) revert InvalidNonce();
 
-        // Verify borrower's EIP-712 signature. Hashlock L-06: use SignatureChecker so that
-        // contract accounts (Gnosis Safes) can withdraw via EIP-1271 — previously only EOAs could.
+        // Verify borrower's EIP-712 signature via SignatureChecker so contract accounts
+        // (Gnosis Safes) can withdraw via EIP-1271.
         bytes32 structHash = keccak256(abi.encode(
             WITHDRAW_INTENT_TYPEHASH, intent.borrower, intent.to, intent.tokenId,
             intent.amount, intent.nonce, intent.deadline
@@ -672,8 +682,8 @@ contract PredmartLendingPool is
         if (block.timestamp > intent.deadline) revert IntentExpired();
         if (intent.nonce != borrowNonces[intent.borrower]) revert InvalidNonce();
 
-        // Verify borrower's EIP-712 signature. Hashlock L-06: use SignatureChecker so that
-        // contract accounts (Gnosis Safes) can borrow via EIP-1271 — previously only EOAs could.
+        // Verify borrower's EIP-712 signature via SignatureChecker so contract accounts
+        // (Gnosis Safes) can borrow via EIP-1271.
         bytes32 structHash = keccak256(abi.encode(
             BORROW_INTENT_TYPEHASH, intent.borrower, intent.tokenId, intent.amount, intent.nonce, intent.deadline
         ));
@@ -692,9 +702,9 @@ contract PredmartLendingPool is
         _executeBorrow(intent.borrower, intent.tokenId, intent.amount, price, priceData.maxBorrow, intent.borrower, true);
     }
 
-    /// @dev H-03 helper — extracted to avoid stack-too-deep in leverageDeposit.
-    ///      Verifies `allowedFrom` consents via EIP-1271/ECDSA signature over the auth hash.
+    /// @dev Verifies `allowedFrom` consents via EIP-1271/ECDSA signature over the auth hash.
     ///      No-op when `allowedFrom == borrower` (self-authorization, signature redundant).
+    ///      Extracted to avoid stack-too-deep in leverageDeposit.
     function _verifyAllowedFromSig(
         address allowedFrom,
         address borrower,
@@ -714,13 +724,13 @@ contract PredmartLendingPool is
     ///      Typical flow: pullUsdcForLeverage() advances pool USDC to relayer → relayer buys shares on
     ///      CLOB → leverageDeposit() deposits all shares and formalizes the advance as real debt.
     ///
-    ///      NONCE DESIGN (LC-02): Nonce is consumed on first borrow, NOT on deposit-only calls.
+    ///      NONCE DESIGN: Nonce is consumed on first borrow, NOT on deposit-only calls.
     ///      Deposit-only calls (borrowAmount=0) are used to add pre-existing Safe shares as collateral
-    ///      before the main deposit+borrow call. Replay safety is provided by the H-03 fromSignature
+    ///      before the main deposit+borrow call. Replay safety is provided by the `fromSignature`
     ///      requirement below: deposits from `allowedFrom` require that address's explicit consent,
     ///      so an attacker cannot replay a deposit-only call against a victim's Safe.
     ///
-    ///      H-03 FIX: When pulling shares from `allowedFrom` (i.e. `from == allowedFrom` and
+    ///      When pulling shares from `allowedFrom` (i.e. `from == allowedFrom` and
     ///      `allowedFrom != borrower`), `fromSignature` must be a valid EIP-712 signature from
     ///      `allowedFrom` over the same LeverageAuth hash. Validated via
     ///      `SignatureChecker.isValidSignatureNow` (supports both ECDSA and EIP-1271), ensuring
@@ -752,12 +762,12 @@ contract PredmartLendingPool is
             auth.maxBorrow, auth.nonce, auth.deadline
         ));
         bytes32 authHash = _hashTypedDataV4(structHash);
-        // Hashlock L-06: use SignatureChecker so contract-account borrowers (Safes) can sign LeverageAuth.
+        // SignatureChecker supports contract-account borrowers (Safes) signing LeverageAuth via EIP-1271.
         if (!SignatureChecker.isValidSignatureNow(auth.borrower, authHash, authSignature)) revert InvalidIntentSignature();
 
-        // H-03 FIX: require `allowedFrom`'s explicit consent when pulling its CTF shares.
-        // A borrower-only signature is insufficient — without this check, an attacker could sign
-        // a LeverageAuth with their own key but set `allowedFrom` to any CTF-approved victim.
+        // Require `allowedFrom`'s explicit consent when pulling its CTF shares.
+        // A borrower-only signature is insufficient — without this check, a user could sign
+        // a LeverageAuth with their own key but set `allowedFrom` to any CTF-approved third party.
         if (data.depositAmount > 0 && data.from != relayer) {
             _verifyAllowedFromSig(auth.allowedFrom, auth.borrower, authHash, fromSignature);
         }
@@ -769,7 +779,7 @@ contract PredmartLendingPool is
         }
 
         if (data.borrowAmount > 0) {
-            // Consume nonce on first borrow, not on deposit-only calls (see LC-02 NatSpec above)
+            // Consume nonce on first borrow, not on deposit-only calls (see NONCE DESIGN NatSpec above)
             bool isFirstBorrow = (leverageBorrowUsed[authHash] == 0);
             if (isFirstBorrow) {
                 if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
@@ -947,7 +957,7 @@ contract PredmartLendingPool is
 
     /// @notice Set the extension contract address. Only usable for initial deployment (extension unset)
     ///         or when the timelock is disabled. For rotating an already-set extension under an active
-    ///         timelock, use `proposeExtension` + `executeExtension` (Hashlock L-01 fix).
+    ///         timelock, use `proposeExtension` + `executeExtension`.
     /// @dev During UUPS upgrades, `initializeVN()` can set the extension atomically via reinitializer,
     ///      bypassing the timelock as part of a governance-approved upgrade.
     function setExtension(address ext) external onlyAdmin {

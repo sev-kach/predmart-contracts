@@ -214,8 +214,7 @@ contract PredmartPoolExtension {
     function transferAdmin(address newAdmin) external onlyAdmin {
         if (newAdmin == address(0)) revert InvalidAddress();
         if (timelockDelay == 0) {
-            // Bootstrap: instant transfer when no timelock. Emit AdminTransferred for off-chain
-            // observability (Hashlock L-02 — previously this branch was silent).
+            // Bootstrap: instant transfer when no timelock. Emit AdminTransferred for off-chain observability.
             emit AdminTransferred(admin, newAdmin);
             admin = newAdmin;
         } else {
@@ -327,7 +326,7 @@ contract PredmartPoolExtension {
 
     /// @notice Activate or increase the timelock delay (one-way ratchet).
     /// @dev Capped at MAX_TIMELOCK_DELAY (10 days) to prevent accidentally bricking governance
-    ///      with an unreachable delay (Hashlock L-03).
+    ///      with an unreachable delay.
     function activateTimelock(uint256 delay) external onlyAdmin {
         if (delay < timelockDelay) revert TimelockCannotDecrease();
         if (delay > MAX_TIMELOCK_DELAY) revert TimelockExceedsMaximum();
@@ -751,8 +750,8 @@ contract PredmartPoolExtension {
         if (block.timestamp > auth.deadline) revert IntentExpired();
         if (auth.nonce != closeNonces[auth.borrower][auth.tokenId]) revert InvalidNonce();
 
-        // Verify EIP-712 signature. Hashlock L-06: use SignatureChecker so contract-account
-        // borrowers (Safes) can sign CloseAuth.
+        // Verify EIP-712 signature via SignatureChecker so contract-account borrowers (Safes)
+        // can sign CloseAuth via EIP-1271.
         bytes32 structHash = keccak256(abi.encode(
             CLOSE_AUTH_TYPEHASH, auth.borrower, auth.allowedTo, auth.tokenId, auth.nonce, auth.deadline
         ));
@@ -957,8 +956,8 @@ contract PredmartPoolExtension {
     ///      TRUST MODEL: Same as leverageDeposit — relayer is trusted to buy shares
     ///      and deposit them via leverageDeposit. Relayer rotation is timelocked (6h).
     ///
-    ///      H-02 FIX: When `allowedFrom != borrower` and `userAmount > 0`, `fromSignature` must be a
-    ///      valid EIP-712 signature from `allowedFrom` over the same LeverageAuth hash. Validated via
+    ///      When `allowedFrom != borrower` and `userAmount > 0`, `fromSignature` must be a valid
+    ///      EIP-712 signature from `allowedFrom` over the same LeverageAuth hash. Validated via
     ///      `SignatureChecker.isValidSignatureNow` (supports both ECDSA and EIP-1271), ensuring that
     ///      a Gnosis Safe's threshold of owners explicitly consents to the USDC pull.
     /// @param auth The user's leverage authorization
@@ -978,7 +977,7 @@ contract PredmartPoolExtension {
         if (msg.sender != relayer) revert NotRelayer();
         if (paused) revert ProtocolPaused();
         if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
-        if (frozenTokens[auth.tokenId]) revert TokenFrozen();  // Hashlock L-04: consistent with leverageDeposit's later check
+        if (frozenTokens[auth.tokenId]) revert TokenFrozen();  // consistent with leverageDeposit's later check
         if (block.timestamp > auth.deadline) revert IntentExpired();
         if (userAmount == 0 && advanceAmount == 0) revert BorrowTooSmall();
 
@@ -987,12 +986,12 @@ contract PredmartPoolExtension {
             auth.maxBorrow, auth.nonce, auth.deadline
         ));
         bytes32 authHash = _hashTypedDataV4Ext(structHash);
-        // Hashlock L-06: use SignatureChecker so contract-account borrowers (Safes) can sign LeverageAuth.
+        // SignatureChecker supports contract-account borrowers (Safes) signing LeverageAuth via EIP-1271.
         if (!SignatureChecker.isValidSignatureNow(auth.borrower, authHash, authSignature)) revert InvalidIntentSignature();
 
-        // H-02 FIX: require `allowedFrom`'s explicit consent when pulling its USDC.
-        // A borrower-only signature is insufficient — without this check, an attacker could sign a
-        // LeverageAuth with their own key but set `allowedFrom` to any USDC-approved victim.
+        // Require `allowedFrom`'s explicit consent when pulling its USDC.
+        // A borrower-only signature is insufficient — without this check, a user could sign a
+        // LeverageAuth with their own key but set `allowedFrom` to any USDC-approved third party.
         if (userAmount > 0 && auth.allowedFrom != auth.borrower) {
             if (!SignatureChecker.isValidSignatureNow(auth.allowedFrom, authHash, fromSignature)) {
                 revert InvalidIntentSignature();
@@ -1021,10 +1020,9 @@ contract PredmartPoolExtension {
 
         // Advance pool USDC to relayer (formalized as borrow in leverageDeposit)
         if (advanceAmount > 0) {
-            // M-01 FIX: track `advanceAmount` (gross) in pendingAdvances/totalPendingAdvances so that
-            //          the borrower's debt in leverageDeposit includes the operation fee. Previously
-            //          we tracked `netAdvance` (post-fee), which meant the fee came out of lender
-            //          reserves instead of being added to the borrower's debt.
+            // Track `advanceAmount` (gross) in pendingAdvances/totalPendingAdvances so the
+            // borrower's debt in leverageDeposit includes the operation fee (fee added to debt,
+            // not taken from lender reserves).
             uint256 fee = operationFee;
             if (advanceAmount <= fee) revert AdvanceTooSmall();
             uint256 netAdvance = advanceAmount - fee;
@@ -1032,8 +1030,8 @@ contract PredmartPoolExtension {
             emit OperationFeeCollected(auth.borrower, fee);
 
             // Liquidity check (inline — extension can't call _availableCash).
-            // M-02 FIX: do NOT subtract `totalPendingAdvances` — those USDC have already left the
-            //           pool's balance, so subtracting again would double-count.
+            // Do NOT subtract `totalPendingAdvances` — those USDC have already left the
+            // pool's balance, so subtracting again would double-count.
             uint256 cash = IERC20(_asset()).balanceOf(address(this));
             if (cash > totalReserves) cash -= totalReserves; else cash = 0;
             if (cash > unsettledRedemptions) cash -= unsettledRedemptions; else cash = 0;
@@ -1041,8 +1039,8 @@ contract PredmartPoolExtension {
             if (cash > protocolFeePool) cash -= protocolFeePool; else cash = 0;
             if (netAdvance > cash) revert InsufficientLiquidity();
 
-            pendingAdvances[authHash] += advanceAmount;   // M-01: gross
-            totalPendingAdvances += advanceAmount;        // M-01: gross
+            pendingAdvances[authHash] += advanceAmount;   // gross
+            totalPendingAdvances += advanceAmount;        // gross
             pendingAdvanceTimestamps[authHash] = block.timestamp;
             IERC20(_asset()).safeTransfer(msg.sender, netAdvance);
             emit PoolAdvancedForLeverage(auth.borrower, netAdvance, auth.tokenId);
