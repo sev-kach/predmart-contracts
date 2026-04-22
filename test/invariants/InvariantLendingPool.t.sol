@@ -101,7 +101,7 @@ contract Handler is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID, amount, _signPrice(TOKEN_ID, PRICE));
+        poolAdmin.depositCollateral(TOKEN_ID, amount, _signPrice(TOKEN_ID, PRICE));
         vm.stopPrank();
     }
 
@@ -140,7 +140,7 @@ contract Handler is Test {
 
         vm.startPrank(borrower);
         usdc.approve(address(pool), amount);
-        pool.repay(TOKEN_ID, amount);
+        poolAdmin.repay(TOKEN_ID, amount);
         vm.stopPrank();
 
         ghost_totalRepaid += amount;
@@ -174,7 +174,7 @@ contract Handler is Test {
     function warpTime(uint256 seconds_) external {
         seconds_ = bound(seconds_, 1, 7 days);
         vm.warp(block.timestamp + seconds_);
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
     }
 
     function _domainSeparator() internal view returns (bytes32) {

@@ -5,11 +5,13 @@ pragma solidity ^0.8.24;
 import { Test, console } from "forge-std/Test.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { ERC1155Holder } from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
 import { PredmartOracle } from "../src/PredmartOracle.sol";
 import { PredmartPoolLib } from "../src/PredmartPoolLib.sol";
-import { NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NotLiquidator } from "../src/PredmartTypes.sol";
+import { NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NotLiquidator, TokenFrozen, CollateralDeposited } from "../src/PredmartTypes.sol";
 import { MockUSDC } from "./mocks/MockUSDC.sol";
 import { MockCTF } from "./mocks/MockCTF.sol";
 
@@ -48,6 +50,11 @@ contract PredmartLendingPoolTest is Test {
     bytes32 public constant CLOSE_AUTH_TYPEHASH = keccak256(
         "CloseAuth(address borrower,address allowedTo,uint256 tokenId,uint256 nonce,uint256 deadline)"
     );
+    bytes32 public constant DEPOSIT_COLLATERAL_FROM_TYPEHASH = keccak256(
+        "DepositCollateralFromAuth(address from,address creditTo,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
+    );
+
+    // CollateralDeposited event imported from PredmartTypes (used by vm.expectEmit)
 
     address public safe; // Simulates user's Safe wallet
 
@@ -214,6 +221,33 @@ contract PredmartLendingPoolTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    /// @dev Helper: build LeverageDepositData struct (keeps test calls concise)
+    function _ldd(address from, address borrowTo, uint256 depositAmount, uint256 borrowAmount)
+        internal pure returns (PredmartLendingPool.LeverageDepositData memory)
+    {
+        return PredmartLendingPool.LeverageDepositData({
+            from: from, borrowTo: borrowTo, depositAmount: depositAmount, borrowAmount: borrowAmount
+        });
+    }
+
+    /// @dev Sign a DepositCollateralFromAuth using EIP-712
+    function _signDepositCollateralFromAuth(
+        uint256 signerKey,
+        address from,
+        address creditTo,
+        uint256 tokenId,
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline
+    ) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(
+            abi.encode(DEPOSIT_COLLATERAL_FROM_TYPEHASH, from, creditTo, tokenId, amount, nonce, deadline)
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, digest);
+        return abi.encodePacked(r, s, v);
+    }
+
     /// @dev Create a signed PriceData struct
     function _signPrice(uint256 tokenId, uint256 price) internal view returns (PredmartOracle.PriceData memory) {
         return _signPriceAt(tokenId, price, block.timestamp);
@@ -266,7 +300,7 @@ contract PredmartLendingPoolTest is Test {
     ) internal {
         vm.startPrank(_borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(tokenId, collateralAmount, _signPrice(tokenId, price));
+        poolAdmin.depositCollateral(tokenId, collateralAmount, _signPrice(tokenId, price));
         vm.stopPrank();
 
         uint256 nonce = pool.borrowNonces(_borrower);
@@ -351,7 +385,7 @@ contract PredmartLendingPoolTest is Test {
     function test_DepositCollateral() public {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -362,7 +396,7 @@ contract PredmartLendingPoolTest is Test {
     function test_WithdrawCollateral_NoDebt() public {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Withdraw via relay (no debt, so price verification is skipped)
@@ -430,7 +464,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -458,7 +492,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 10_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 10_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -484,7 +518,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         usdc.approve(address(pool), type(uint256).max);
-        pool.repay(TOKEN_ID_YES, type(uint256).max);
+        poolAdmin.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
         (,uint256 debt,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -498,7 +532,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         usdc.approve(address(pool), type(uint256).max);
-        pool.repay(TOKEN_ID_YES, 500e6);
+        poolAdmin.repay(TOKEN_ID_YES, 500e6);
         vm.stopPrank();
 
         (,uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -518,7 +552,7 @@ contract PredmartLendingPoolTest is Test {
         vm.warp(block.timestamp + 365.25 days);
 
         // Trigger interest accrual via public function
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         // Debt should be significantly more than 2000 after 1 year of interest
         // Base rate ~5% + utilization-driven rate, times rate multiplier of 1.25x at $0.80
@@ -536,7 +570,7 @@ contract PredmartLendingPoolTest is Test {
         vm.warp(block.timestamp + 30 days);
 
         // Trigger accrual
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         uint256 totalAssetsAfter = pool.totalAssets();
         assertGt(totalAssetsAfter, totalAssetsBefore, "totalAssets should grow from interest");
@@ -648,7 +682,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         vm.expectRevert(PredmartLendingPool.MarketResolved.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -711,7 +745,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -739,7 +773,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -778,7 +812,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -809,6 +843,21 @@ contract PredmartLendingPoolTest is Test {
         assertEq(pool.admin(), newAdmin);
     }
 
+    /// @dev Hashlock L-02: instant-transfer branch (timelockDelay=0) must emit AdminTransferred
+    ///      so off-chain observers can track the change.
+    function test_TransferAdmin_L02_EmitsEventInInstantBranch() public {
+        // timelockDelay is 0 in fresh test setup — this hits the instant path
+        address newAdmin = makeAddr("newAdmin");
+
+        vm.expectEmit(true, true, false, false);
+        emit PredmartPoolExtension.AdminTransferred(admin, newAdmin);
+
+        vm.prank(admin);
+        poolAdmin.transferAdmin(newAdmin);
+
+        assertEq(pool.admin(), newAdmin, "Admin changed");
+    }
+
     function test_TransferAdmin_RevertsNonAdmin() public {
         vm.prank(lender);
         vm.expectRevert(NotAdmin.selector);
@@ -832,7 +881,7 @@ contract PredmartLendingPoolTest is Test {
         vm.warp(block.timestamp + 365.25 days);
 
         // Trigger accrual
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         uint256 reserves = pool.totalReserves();
         assertGt(reserves, 0, "Should have reserves");
@@ -850,7 +899,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -883,7 +932,7 @@ contract PredmartLendingPoolTest is Test {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
         vm.expectRevert(PredmartLendingPool.ProtocolPaused.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -898,7 +947,7 @@ contract PredmartLendingPoolTest is Test {
         // Repay still works
         vm.startPrank(borrower);
         usdc.approve(address(pool), type(uint256).max);
-        pool.repay(TOKEN_ID_YES, 500e6);
+        poolAdmin.repay(TOKEN_ID_YES, 500e6);
         vm.stopPrank();
 
         assertEq(pool.totalBorrowAssets(), 1_500e6);
@@ -1046,7 +1095,7 @@ contract PredmartLendingPoolTest is Test {
         vm.warp(block.timestamp + 365.25 days);
 
         // Trigger accrual
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         uint256 valueAfterPerShare = pool.convertToAssets(1e12);
         assertGt(valueAfterPerShare, valueBeforePerShare, "pUSDC should be worth more after interest accrues");
@@ -1077,7 +1126,7 @@ contract PredmartLendingPoolTest is Test {
         // LTV at 0.80 = 70%, maxBorrow = 5000 * 0.80 * 0.70 = 2,800 — within LTV but exceeds cap.
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1110,7 +1159,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         usdc.approve(address(pool), 1_000e6);
-        pool.repay(TOKEN_ID_YES, 1_000e6);
+        poolAdmin.repay(TOKEN_ID_YES, 1_000e6);
         vm.stopPrank();
 
         // Should have decreased by the repay amount
@@ -1181,7 +1230,7 @@ contract PredmartLendingPoolTest is Test {
         assertLt(hfAtBorrow, type(uint256).max, "HF should be finite with debt");
 
         // Verify accrueInterest() produces the same result (consistency check)
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
         uint256 debtAfterAccrual = pool.getPositionDebt(borrower, TOKEN_ID_YES);
         uint256 totalAssetsAfterAccrual = pool.totalAssets();
         assertEq(debtAfter, debtAfterAccrual, "View debt should match post-accrual debt");
@@ -1197,7 +1246,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1223,7 +1272,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1248,7 +1297,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1273,7 +1322,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1299,7 +1348,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
 
@@ -1528,6 +1577,26 @@ contract PredmartLendingPoolTest is Test {
         poolAdmin.activateTimelock(1 hours);
     }
 
+    /// @dev Hashlock L-03: reject delays above MAX_TIMELOCK_DELAY (10 days).
+    ///      Without this cap, a fat-finger value could permanently brick governance.
+    function test_ActivateTimelock_L03_RevertsAboveMaximum() public {
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockExceedsMaximum.selector);
+        poolAdmin.activateTimelock(11 days);
+    }
+
+    function test_ActivateTimelock_L03_AllowsExactlyMaximum() public {
+        vm.prank(admin);
+        poolAdmin.activateTimelock(10 days);
+        assertEq(pool.timelockDelay(), 10 days, "Exactly MAX_TIMELOCK_DELAY accepted");
+    }
+
+    function test_ActivateTimelock_L03_RevertsHugeValue() public {
+        vm.prank(admin);
+        vm.expectRevert(PredmartPoolExtension.TimelockExceedsMaximum.selector);
+        poolAdmin.activateTimelock(type(uint256).max);
+    }
+
     function test_ExecuteAddress_RevertsNoPendingChange() public {
         _activateTimelock();
 
@@ -1563,6 +1632,78 @@ contract PredmartLendingPoolTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
+            TEST: L-01 — TIMELOCKED EXTENSION ROTATION
+    //////////////////////////////////////////////////////////////*/
+
+    function test_ProposeExtension_RevertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(InvalidAddress.selector);
+        pool.proposeExtension(address(0));
+    }
+
+    function test_ProposeExtension_RevertsNotAdmin() public {
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        vm.prank(borrower);
+        vm.expectRevert(NotAdmin.selector);
+        pool.proposeExtension(address(newExt));
+    }
+
+    function test_ExecuteExtension_RevertsNoPendingChange() public {
+        vm.prank(admin);
+        vm.expectRevert(NoPendingChange.selector);
+        pool.executeExtension();
+    }
+
+    function test_ExecuteExtension_RevertsTimelockNotReady() public {
+        _activateTimelock();
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+
+        vm.prank(admin);
+        pool.proposeExtension(address(newExt));
+
+        // Try to execute before timelock elapses
+        vm.prank(admin);
+        vm.expectRevert(TimelockNotReady.selector);
+        pool.executeExtension();
+    }
+
+    function test_ProposeExecuteExtension_HappyPath() public {
+        _activateTimelock();
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        address oldExt = pool.extension();
+
+        vm.prank(admin);
+        pool.proposeExtension(address(newExt));
+
+        assertEq(pool.pendingExtension(), address(newExt), "Pending set");
+        assertEq(pool.extension(), oldExt, "Current extension unchanged during propose");
+
+        // Wait out the timelock
+        vm.warp(pool.pendingExtensionExecAfter());
+
+        vm.prank(admin);
+        pool.executeExtension();
+
+        assertEq(pool.extension(), address(newExt), "Extension rotated");
+        assertEq(pool.pendingExtension(), address(0), "Pending cleared");
+        assertEq(pool.pendingExtensionExecAfter(), 0, "ExecAfter cleared");
+    }
+
+    function test_ProposeExtension_OverwriteReplacesPending() public {
+        _activateTimelock();
+        PredmartPoolExtension ext1 = new PredmartPoolExtension();
+        PredmartPoolExtension ext2 = new PredmartPoolExtension();
+
+        vm.prank(admin);
+        pool.proposeExtension(address(ext1));
+        assertEq(pool.pendingExtension(), address(ext1));
+
+        vm.prank(admin);
+        pool.proposeExtension(address(ext2));
+        assertEq(pool.pendingExtension(), address(ext2), "Second proposal overwrites first");
+    }
+
+    /*//////////////////////////////////////////////////////////////
                       TEST: LEVERAGE STEP
     //////////////////////////////////////////////////////////////*/
 
@@ -1572,7 +1713,7 @@ contract PredmartLendingPoolTest is Test {
         // Borrower deposits collateral first
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 3_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 3_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Relayer holds some CTF shares (simulating post-CLOB purchase)
@@ -1596,7 +1737,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Relayer deposits 2000 shares (from relayer itself) + borrows 1000 USDC
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 2_000e6, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 2_000e6, 1_000e6), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         // Verify: borrower's position now has 5000 collateral (3000 initial + 2000 from leverage)
         (uint256 collateral, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -1611,7 +1752,7 @@ contract PredmartLendingPoolTest is Test {
         // Borrower deposits some initial collateral
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Relayer has shares
@@ -1635,7 +1776,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Deposit only, no borrow — nonce should NOT be consumed
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 2_000e6, 0, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 2_000e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 3_000e6, "Collateral increased");
@@ -1647,7 +1788,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1666,20 +1807,20 @@ contract PredmartLendingPoolTest is Test {
 
         // Step 1: borrow 800
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 800e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 800e6), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         // Step 2: borrow 800 more (total 1600 < 2000 budget)
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 800e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 800e6), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         // Step 3: try to borrow 500 more (total 2100 > 2000 budget)
         vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.ExceedsBorrowBudget.selector);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         // Step 3 corrected: borrow exactly remaining 400
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 400e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 400e6), _signPrice(TOKEN_ID_YES, 0.80e18));
 
         assertEq(pool.totalBorrowAssets(), 2_000e6, "Total borrowed matches budget");
     }
@@ -1689,7 +1830,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1706,7 +1847,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.prank(liquidator);
         vm.expectRevert(NotRelayer.selector);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_LeverageStep_RevertsExpired() public {
@@ -1714,7 +1855,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1731,7 +1872,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.IntentExpired.selector);
-        pool.leverageDeposit(auth, sig, relayer, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 0, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_LeverageStep_RevertsInvalidFrom() public {
@@ -1739,7 +1880,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1757,7 +1898,7 @@ contract PredmartLendingPoolTest is Test {
         address attacker = makeAddr("attacker");
         vm.prank(relayer);
         vm.expectRevert(InvalidAddress.selector);
-        pool.leverageDeposit(auth, sig, attacker, relayer, 500e6, 0, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, sig, "", _ldd(attacker, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     function test_LeverageStep_RevertsInvalidSignature() public {
@@ -1765,7 +1906,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 nonce = pool.leverageNonces(borrower);
@@ -1783,7 +1924,529 @@ contract PredmartLendingPoolTest is Test {
 
         vm.prank(relayer);
         vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
-        pool.leverageDeposit(auth, wrongSig, relayer, relayer, 0, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        pool.leverageDeposit(auth, wrongSig, "", _ldd(relayer, relayer, 0, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        TEST: PULL USDC FOR LEVERAGE (Hashlock H-02 — allowedFrom consent)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev H-02 attack: attacker signs LeverageAuth with their own key but sets allowedFrom
+    ///      to a USDC-approved victim. Without fromSignature, the contract must reject.
+    function test_PullUsdc_H02_AttackBlocked_MissingFromSignature() public {
+        _supply(lender, 50_000e6);
+
+        // Victim has granted USDC allowance to the pool (standard lender setup)
+        uint256 victimKey = 0xDEAD;
+        address victim = vm.addr(victimKey);
+        usdc.mint(victim, 5_000e6);
+        vm.prank(victim);
+        usdc.approve(address(pool), type(uint256).max);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: victim,         // attacker-controlled: points to victim
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 5_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, victim, TOKEN_ID_YES, 5_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        poolAdmin.pullUsdcForLeverage(
+            _castAuth(auth), authSig, "", /* empty fromSignature */ 2_000e6, 0
+        );
+    }
+
+    /// @dev Legitimate flow: allowedFrom (separate wallet) signs the same authHash alongside borrower.
+    function test_PullUsdc_LegitimateFlow_AllowedFromSigns() public {
+        _supply(lender, 50_000e6);
+
+        uint256 safeOwnerKey = 0x5AFE;
+        address safeOwner = vm.addr(safeOwnerKey);
+        usdc.mint(safeOwner, 5_000e6);
+        vm.prank(safeOwner);
+        usdc.approve(address(pool), type(uint256).max);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safeOwner,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 5_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        // Borrower and allowedFrom both sign the same authHash
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, safeOwner, TOKEN_ID_YES, 5_000e6, nonce, deadline);
+        bytes memory fromSig = _signLeverageAuth(safeOwnerKey,        borrower, safeOwner, TOKEN_ID_YES, 5_000e6, nonce, deadline);
+
+        uint256 victimBefore = usdc.balanceOf(safeOwner);
+        uint256 relayerBefore = usdc.balanceOf(relayer);
+
+        vm.prank(relayer);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, fromSig, 2_000e6, 0);
+
+        assertEq(usdc.balanceOf(safeOwner), victimBefore - 2_000e6, "USDC pulled from allowedFrom");
+        assertEq(usdc.balanceOf(relayer), relayerBefore + 2_000e6, "USDC received by relayer");
+    }
+
+    /// @dev When allowedFrom == borrower, fromSignature can be empty (self-authorization).
+    function test_PullUsdc_AllowedFromEqualsBorrower_NoFromSigNeeded() public {
+        _supply(lender, 50_000e6);
+
+        usdc.mint(borrower, 5_000e6);
+        vm.prank(borrower);
+        usdc.approve(address(pool), type(uint256).max);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: borrower,          // same as borrower
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 5_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 5_000e6, nonce, deadline);
+
+        uint256 borrowerBefore = usdc.balanceOf(borrower);
+
+        vm.prank(relayer);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 2_000e6, 0);
+
+        assertEq(usdc.balanceOf(borrower), borrowerBefore - 2_000e6, "USDC pulled from borrower");
+    }
+
+    /// @dev When userAmount == 0 (advance only), no pull from allowedFrom happens,
+    ///      so fromSignature is not required even if allowedFrom != borrower.
+    function test_PullUsdc_AdvanceOnly_NoFromSigNeeded() public {
+        _supply(lender, 50_000e6);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,              // different from borrower, but not used
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 5_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 5_000e6, nonce, deadline);
+
+        uint256 relayerBefore = usdc.balanceOf(relayer);
+
+        vm.prank(relayer);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, 1_000e6);
+
+        assertGt(usdc.balanceOf(relayer), relayerBefore, "Advance delivered to relayer");
+    }
+
+    /// @dev Hashlock L-06: withdrawViaRelay must accept EIP-1271 signatures so contract accounts
+    ///      (Gnosis Safes) can authorize withdrawals — previously only EOA signatures worked,
+    ///      meaning any collateral deposited by a contract was stuck.
+    function test_WithdrawViaRelay_L06_EIP1271ContractSignerWorks() public {
+        _supply(lender, 50_000e6);
+
+        uint256 safeOwnerKey = 0xC0FFEE;
+        address safeOwner = vm.addr(safeOwnerKey);
+        MockSafe1271 safeAcct = new MockSafe1271(safeOwner);
+
+        // Safe has CTF shares and deposits them directly as collateral
+        ctf.mint(address(safeAcct), TOKEN_ID_YES, 5_000e6);
+        vm.prank(address(safeAcct));
+        ctf.setApprovalForAll(address(pool), true);
+        vm.prank(address(safeAcct));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 3_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Safe owner signs WithdrawIntent — Safe's EIP-1271 validates this via ECDSA recovery
+        uint256 nonce = pool.withdrawNonces(address(safeAcct));
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signWithdrawIntent(safeOwnerKey, address(safeAcct), address(safeAcct), TOKEN_ID_YES, 2_000e6, nonce, deadline);
+        PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool.WithdrawIntent({
+            borrower: address(safeAcct),
+            to: address(safeAcct),
+            tokenId: TOKEN_ID_YES,
+            amount: 2_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+
+        uint256 safeSharesBefore = ctf.balanceOf(address(safeAcct), TOKEN_ID_YES);
+
+        vm.prank(relayer);
+        pool.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        assertEq(ctf.balanceOf(address(safeAcct), TOKEN_ID_YES), safeSharesBefore + 2_000e6, "Shares withdrawn to Safe via EIP-1271");
+    }
+
+    /// @dev Hashlock L-04: pullUsdcForLeverage must reject frozen tokens before sending USDC,
+    ///      otherwise relayer gets USDC it can't deposit via leverageDeposit (which checks frozen).
+    function test_PullUsdc_L04_RevertsFrozenToken() public {
+        _supply(lender, 50_000e6);
+
+        // Admin freezes the token
+        vm.prank(admin);
+        poolAdmin.setTokenFrozen(TOKEN_ID_YES, true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: borrower,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(TokenFrozen.selector);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, 1_000e6);
+    }
+
+    /// @dev Hashlock M-01: pendingAdvances must track GROSS advance (including fee),
+    ///      so that leverageDeposit settles with gross debt — fee paid by borrower, not lenders.
+    function test_PullUsdc_M01_FeePaidByBorrowerNotLenders() public {
+        _supply(lender, 50_000e6);
+        _enableFee();
+
+        uint256 advanceAmount = 1_000e6;
+        uint256 fee = pool.operationFee();
+        uint256 opFeePoolBefore = pool.operationFeePool();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: borrower,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: advanceAmount,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, advanceAmount, nonce, deadline);
+
+        bytes32 structHash = keccak256(abi.encode(
+            LEVERAGE_AUTH_TYPEHASH, borrower, borrower, TOKEN_ID_YES, advanceAmount, nonce, deadline
+        ));
+        bytes32 authHash = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
+
+        vm.prank(relayer);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, advanceAmount);
+
+        // M-01: pendingAdvance tracks GROSS, not NET. Previously was `advanceAmount - fee`.
+        assertEq(pool.pendingAdvances(authHash), advanceAmount, "pendingAdvance = GROSS (includes fee)");
+        assertEq(pool.totalPendingAdvances(), advanceAmount, "totalPendingAdvances = GROSS");
+        // Fee is still accounted as protocol revenue
+        assertEq(pool.operationFeePool(), opFeePoolBefore + fee, "operationFeePool received the fee");
+    }
+
+    /// @dev Hashlock M-02: _availableCash must not double-discount pending advances.
+    ///      The advance USDC has already left the pool's balance, so the decrease should be
+    ///      exactly (advanceAmount - fee) sent + fee earmarked = advanceAmount total — not 2x.
+    function test_PullUsdc_M02_AvailableCashNoDoubleDiscount() public {
+        _supply(lender, 50_000e6);
+        _enableFee();
+
+        uint256 advanceAmount = 1_000e6;
+        uint256 maxWithdrawBefore = pool.maxWithdraw(lender);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: borrower,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: advanceAmount,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, advanceAmount, nonce, deadline);
+
+        vm.prank(relayer);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, advanceAmount);
+
+        uint256 maxWithdrawAfter = pool.maxWithdraw(lender);
+        uint256 decrease = maxWithdrawBefore - maxWithdrawAfter;
+
+        // M-02: decrease = advanceAmount (sent to relayer, minus fee still in balance but earmarked).
+        // Pre-fix would have decreased by ~2 * advanceAmount due to double-counting.
+        assertEq(decrease, advanceAmount, "maxWithdraw dropped by exactly advanceAmount (no double discount)");
+    }
+
+    /// @dev Helper: cast PredmartLendingPool.LeverageAuth to PredmartPoolExtension.LeverageAuth
+    ///      (same struct layout, different declaring contract)
+    function _castAuth(PredmartLendingPool.LeverageAuth memory a)
+        internal pure returns (PredmartPoolExtension.LeverageAuth memory)
+    {
+        return PredmartPoolExtension.LeverageAuth({
+            borrower: a.borrower,
+            allowedFrom: a.allowedFrom,
+            tokenId: a.tokenId,
+            maxBorrow: a.maxBorrow,
+            nonce: a.nonce,
+            deadline: a.deadline
+        });
+    }
+
+    /*//////////////////////////////////////////////////////////////
+        TEST: LEVERAGE DEPOSIT (Hashlock H-03 — allowedFrom consent)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev H-03 attack: attacker signs LeverageAuth with allowedFrom=VICTIM_SAFE. Victim has
+    ///      granted setApprovalForAll on CTF to the pool. Without fromSignature, contract must reject.
+    function test_LeverageDeposit_H03_AttackBlocked_MissingFromSignature() public {
+        _supply(lender, 50_000e6);
+
+        // Victim has granted CTF approval (standard for any user who ever deposited collateral)
+        uint256 victimKey = 0xDEAD;
+        address victim = vm.addr(victimKey);
+        ctf.mint(victim, TOKEN_ID_YES, 5_000e6);
+        vm.prank(victim);
+        ctf.setApprovalForAll(address(pool), true);
+
+        // Attacker signs auth with victim as allowedFrom
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,               // attacker
+            allowedFrom: victim,              // attacker-controlled: points to victim
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 0,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, victim, TOKEN_ID_YES, 0, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.leverageDeposit(auth, authSig, "", /* no fromSig */ _ldd(victim, relayer, 2_000e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /// @dev Legitimate flow: allowedFrom (separate wallet) signs the same authHash.
+    function test_LeverageDeposit_LegitimateFlow_AllowedFromSigns() public {
+        _supply(lender, 50_000e6);
+
+        uint256 safeOwnerKey = 0x5AFE;
+        address safeOwner = vm.addr(safeOwnerKey);
+        ctf.mint(safeOwner, TOKEN_ID_YES, 5_000e6);
+        vm.prank(safeOwner);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safeOwner,
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 0,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, safeOwner, TOKEN_ID_YES, 0, nonce, deadline);
+        bytes memory fromSig = _signLeverageAuth(safeOwnerKey,        borrower, safeOwner, TOKEN_ID_YES, 0, nonce, deadline);
+
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, authSig, fromSig, _ldd(safeOwner, relayer, 2_000e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 2_000e6, "Shares credited to borrower's position");
+        assertEq(ctf.balanceOf(safeOwner, TOKEN_ID_YES), 3_000e6, "Shares pulled from safeOwner");
+    }
+
+    /// @dev Existing relayer-deposit flow still works: from=relayer, no fromSig needed.
+    ///      (This is the primary path after a CLOB buy — shares sit in relayer before deposit.)
+    function test_LeverageDeposit_FromRelayer_NoFromSigNeeded() public {
+        _supply(lender, 50_000e6);
+
+        ctf.mint(relayer, TOKEN_ID_YES, 5_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,               // different from borrower, unused
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 0,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 0, nonce, deadline);
+
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, authSig, "", _ldd(relayer, relayer, 2_000e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 2_000e6, "Shares credited to borrower's position");
+    }
+
+    /// @dev depositAmount=0 (borrow-only or settle-advance) does not require fromSignature.
+    function test_LeverageDeposit_DepositAmountZero_NoFromSigNeeded() public {
+        _supply(lender, 50_000e6);
+
+        // Pre-deposit some collateral directly so a borrow against it is possible
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 3_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: safe,               // not borrower, but unused (depositAmount=0)
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        // from = relayer, depositAmount = 0 — pure borrow, no fromSig required
+        pool.leverageDeposit(auth, authSig, "", _ldd(relayer, relayer, 0, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        assertEq(pool.leverageNonces(borrower), nonce + 1, "Nonce consumed on first borrow");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+       TEST: EIP-1271 EDGE CASES (H-01 / H-02 / H-03 signature paths)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev Gnosis Safe-style contract validates owner's signature via EIP-1271 → deposit succeeds.
+    function test_DepositCollateralFrom_EIP1271_ValidSafeSignature() public {
+        uint256 ownerKey = 0x5A5E_0;
+        address ownerAddr = vm.addr(ownerKey);
+        MockSafe1271 safe1271 = new MockSafe1271(ownerAddr);
+
+        ctf.mint(address(safe1271), TOKEN_ID_YES, 5_000e6);
+        vm.prank(address(safe1271));
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(address(safe1271));
+        uint256 deadline = block.timestamp + 300;
+        // Owner signs on behalf of the Safe — Safe's isValidSignature validates via ECDSA recovery
+        bytes memory sig = _signDepositCollateralFromAuth(
+            ownerKey, address(safe1271), borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        pool.depositCollateralFrom(
+            address(safe1271), borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig,
+            _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 1_000e6, "Shares credited to borrower's position");
+    }
+
+    /// @dev Contract returns a non-magic value → SignatureChecker rejects → reverts with InvalidIntentSignature.
+    function test_DepositCollateralFrom_EIP1271_WrongMagicValue_Reverts() public {
+        MockSafe1271WrongMagic badSafe = new MockSafe1271WrongMagic();
+        ctf.mint(address(badSafe), TOKEN_ID_YES, 5_000e6);
+        vm.prank(address(badSafe));
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(address(badSafe));
+        uint256 deadline = block.timestamp + 300;
+        // Any signature bytes — the mock will return wrong magic regardless
+        bytes memory sig = hex"deadbeef";
+
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.depositCollateralFrom(
+            address(badSafe), borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig,
+            _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+    }
+
+    /// @dev Contract whose isValidSignature reverts — SignatureChecker must handle gracefully
+    ///      and the overall tx must revert with InvalidIntentSignature (not bubble up the inner revert).
+    function test_DepositCollateralFrom_EIP1271_Reverts_HandledGracefully() public {
+        MockSafe1271Reverts revertingSafe = new MockSafe1271Reverts();
+        ctf.mint(address(revertingSafe), TOKEN_ID_YES, 5_000e6);
+        vm.prank(address(revertingSafe));
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(address(revertingSafe));
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = hex"deadbeef";
+
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.depositCollateralFrom(
+            address(revertingSafe), borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig,
+            _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+    }
+
+    /// @dev H-02: Attacker sets `allowedFrom` = victim's Safe (they don't own), provides their own signature.
+    ///      Safe's isValidSignature rejects because attacker isn't a registered owner. Reverts.
+    function test_PullUsdc_EIP1271_AttackerCannotSpoofSafe() public {
+        _supply(lender, 50_000e6);
+
+        // Real Safe has a legitimate owner (not the attacker)
+        uint256 ownerKey = 0x5A5E_1;
+        address ownerAddr = vm.addr(ownerKey);
+        MockSafe1271 victimSafe = new MockSafe1271(ownerAddr);
+        usdc.mint(address(victimSafe), 5_000e6);
+        vm.prank(address(victimSafe));
+        usdc.approve(address(pool), type(uint256).max);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: address(victimSafe),
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 5_000e6,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, address(victimSafe), TOKEN_ID_YES, 5_000e6, nonce, deadline);
+        // Attacker signs fromSig with borrower's (attacker's) key — but safe validates against ownerKey
+        bytes memory forgedFromSig = _signLeverageAuth(borrowerPrivateKey, borrower, address(victimSafe), TOKEN_ID_YES, 5_000e6, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, forgedFromSig, 2_000e6, 0);
+    }
+
+    /// @dev H-03: Same spoofing attempt for leverageDeposit. Safe rejects attacker's own signature.
+    function test_LeverageDeposit_EIP1271_AttackerCannotSpoofSafe() public {
+        _supply(lender, 50_000e6);
+
+        uint256 ownerKey = 0x5A5E_2;
+        address ownerAddr = vm.addr(ownerKey);
+        MockSafe1271 victimSafe = new MockSafe1271(ownerAddr);
+        ctf.mint(address(victimSafe), TOKEN_ID_YES, 5_000e6);
+        vm.prank(address(victimSafe));
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower,
+            allowedFrom: address(victimSafe),
+            tokenId: TOKEN_ID_YES,
+            maxBorrow: 0,
+            nonce: nonce,
+            deadline: deadline
+        });
+        bytes memory authSig = _signLeverageAuth(borrowerPrivateKey, borrower, address(victimSafe), TOKEN_ID_YES, 0, nonce, deadline);
+        bytes memory forgedFromSig = _signLeverageAuth(borrowerPrivateKey, borrower, address(victimSafe), TOKEN_ID_YES, 0, nonce, deadline);
+
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.leverageDeposit(auth, authSig, forgedFromSig, _ldd(address(victimSafe), relayer, 2_000e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1795,7 +2458,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Try to borrow $0.50 — below MIN_BORROW ($1)
@@ -1839,7 +2502,7 @@ contract PredmartLendingPoolTest is Test {
         // Full repay with type(uint256).max
         vm.startPrank(borrower);
         usdc.approve(address(pool), type(uint256).max);
-        pool.repay(TOKEN_ID_YES, type(uint256).max);
+        poolAdmin.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
         (, uint256 borrowShares,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -1858,8 +2521,8 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        vm.expectRevert(PredmartLendingPool.TokenFrozen.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.expectRevert(TokenFrozen.selector);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
     }
 
@@ -1869,7 +2532,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit before freeze
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Freeze the token
@@ -1889,7 +2552,7 @@ contract PredmartLendingPoolTest is Test {
         bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline);
 
         vm.prank(relayer);
-        vm.expectRevert(PredmartLendingPool.TokenFrozen.selector);
+        vm.expectRevert(TokenFrozen.selector);
         pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
     }
 
@@ -1904,7 +2567,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit works after unfreeze
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
@@ -1925,7 +2588,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Accrue significant interest
         vm.warp(block.timestamp + 180 days);
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
 
@@ -2056,7 +2719,7 @@ contract PredmartLendingPoolTest is Test {
 
         // Accrue interest for 5 years at high utilization
         vm.warp(block.timestamp + 1825 days);
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
         assertGt(debt, 5_000e6, "Debt exceeds collateral value due to interest");
@@ -2228,30 +2891,175 @@ contract PredmartLendingPoolTest is Test {
     }
 
     /*//////////////////////////////////////////////////////////////
-        TEST: DEPOSIT COLLATERAL FROM (Safe ownership check)
+        TEST: DEPOSIT COLLATERAL FROM (EIP-1271 signature auth — Hashlock H-01)
     //////////////////////////////////////////////////////////////*/
 
-    function test_DepositCollateralFrom_SameAddress() public {
-        // msg.sender == from — no isOwner check needed
+    function test_DepositCollateralFrom_ValidEOASignature() public {
+        // EOA `from` signs authorization → any submitter can call depositCollateralFrom
         ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
 
-        vm.startPrank(borrower);
+        vm.prank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateralFrom(borrower, TOKEN_ID_YES, 2_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
-        vm.stopPrank();
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 2_000e6, nonce, deadline
+        );
+
+        // Anyone can submit — authorization is in the signature, not msg.sender
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 2_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
 
         (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
         assertEq(collateral, 2_000e6);
+        assertEq(pool.depositCollateralFromNonces(borrower), nonce + 1, "Nonce consumed");
     }
 
-    function test_DepositCollateralFrom_RevertsNotOwner() public {
-        // Create a mock "Safe" that returns false for isOwner
-        // No need to mint — the isOwner check happens before the transfer
-        address fakeSafe = address(new MockSafeRejectsAll());
+    function test_DepositCollateralFrom_RevertsInvalidSignature() public {
+        // Attacker signs with their own key but sets `from` to victim — should revert
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
 
-        vm.prank(borrower); // borrower is NOT an owner of fakeSafe
-        vm.expectRevert(PredmartLendingPool.NotProxyOwner.selector);
-        pool.depositCollateralFrom(fakeSafe, TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        uint256 attackerKey = 0xA77AC;
+        address attacker = vm.addr(attackerKey);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        // Attacker signs, but `from` is the victim (borrower) — signature won't match borrower
+        bytes memory wrongSig = _signDepositCollateralFromAuth(
+            attackerKey, borrower, attacker, TOKEN_ID_YES, 2_000e6, nonce, deadline
+        );
+
+        vm.prank(attacker);
+        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
+        pool.depositCollateralFrom(
+            borrower, attacker, TOKEN_ID_YES, 2_000e6, nonce, deadline, wrongSig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+    }
+
+    function test_DepositCollateralFrom_RevertsNonceReplay() public {
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        // First submission succeeds
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+
+        // Replay with same nonce reverts
+        vm.expectRevert(PredmartLendingPool.InvalidNonce.selector);
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+    }
+
+    function test_DepositCollateralFrom_RevertsExpiredDeadline() public {
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        vm.warp(deadline + 1);
+
+        vm.expectRevert(PredmartLendingPool.IntentExpired.selector);
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+    }
+
+    /// @dev Relayer-submitted deposit charges operationFee in shares (spam protection).
+    ///      Event semantic: `CollateralDeposited.amount` = actual position state change (net of fee).
+    function test_DepositCollateralFrom_FeeChargedOnRelayCall() public {
+        _enableFee();
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        // Price = 0.80 USDC/share → fee = $0.03 / 0.80 = 0.0375 shares = 37_500 (scaled)
+        uint256 expectedFee = uint256(30_000) * 1e18 / 0.80e18;
+        if (expectedFee * 0.80e18 < 30_000 * 1e18) expectedFee += 1; // ceiling rounding
+        uint256 expectedCredited = 1_000e6 - expectedFee;
+
+        // Event must emit the net credited amount (not the full pre-fee amount)
+        vm.expectEmit(true, true, false, true);
+        emit CollateralDeposited(borrower, TOKEN_ID_YES, expectedCredited);
+
+        vm.prank(relayer);
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, expectedCredited, "Position credited post-fee");
+        assertEq(pool.feeSharesAccumulated(TOKEN_ID_YES), expectedFee, "Fee accumulated in shares pool");
+    }
+
+    /// @dev Direct (non-relay) deposit bypasses the fee — user pays their own gas.
+    function test_DepositCollateralFrom_NoFeeOnDirectCall() public {
+        _enableFee();
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        // Direct call (msg.sender = test contract, not relayer) → no fee
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1_000e6, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 1_000e6, "Full amount credited - no fee on direct call");
+        assertEq(pool.feeSharesAccumulated(TOKEN_ID_YES), 0, "No fee accumulated");
+    }
+
+    /// @dev Dust-sized deposit (amount < fee) is entirely consumed as fee.
+    function test_DepositCollateralFrom_DustFeeCap() public {
+        _enableFee();
+        ctf.mint(borrower, TOKEN_ID_YES, 5_000e6);
+        vm.prank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+
+        uint256 nonce = pool.depositCollateralFromNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        // Tiny deposit: 1000 raw shares (= $0.0008 worth at $0.80 price) — less than $0.03 fee
+        bytes memory sig = _signDepositCollateralFromAuth(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 1000, nonce, deadline
+        );
+
+        vm.prank(relayer);
+        pool.depositCollateralFrom(
+            borrower, borrower, TOKEN_ID_YES, 1000, nonce, deadline, sig, _signPrice(TOKEN_ID_YES, 0.80e18)
+        );
+
+        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 0, "Dust deposit fully consumed as fee");
+        assertEq(pool.feeSharesAccumulated(TOKEN_ID_YES), 1000, "All shares went to fee pool");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -2321,7 +3129,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 5_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Borrow
@@ -2340,7 +3148,7 @@ contract PredmartLendingPoolTest is Test {
         // Full repay
         vm.startPrank(borrower);
         usdc.approve(address(pool), type(uint256).max);
-        pool.repay(TOKEN_ID_YES, type(uint256).max);
+        poolAdmin.repay(TOKEN_ID_YES, type(uint256).max);
         vm.stopPrank();
 
         // Invariant: no dust shares remain
@@ -2586,7 +3394,7 @@ contract PredmartLendingPoolTest is Test {
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
         vm.expectRevert(PredmartLendingPool.PositionHasPendingClose.selector);
-        pool.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Second close on same tokenId should also fail — pending close still exists
@@ -2604,7 +3412,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit collateral without borrowing
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 500e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Flash close on zero-debt position should revert (use withdrawViaRelay instead)
@@ -2767,7 +3575,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit collateral
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 borrowerBalBefore = usdc.balanceOf(borrower);
@@ -2798,7 +3606,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 borrowerBalBefore = usdc.balanceOf(borrower);
@@ -2849,7 +3657,7 @@ contract PredmartLendingPoolTest is Test {
         // Deposit collateral, no borrow
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         uint256 withdrawAmt = 500e6;
@@ -2877,7 +3685,7 @@ contract PredmartLendingPoolTest is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        pool.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
         vm.stopPrank();
 
         // Withdraw 1 share at $0.01 → fee = 3 shares > 1 share → entire withdrawal taken as fee
@@ -2904,9 +3712,10 @@ contract PredmartLendingPoolTest is Test {
         _supply(lender, 50_000e6);
         _enableFee();
 
-        // Mint shares to safe for leverage deposits
-        ctf.mint(safe, TOKEN_ID_YES, 5000e6);
-        vm.prank(safe);
+        // Mint shares to relayer for leverage deposits (H-03 fix: deposits from `allowedFrom` require
+        // the Safe's signature; this test focuses on fee logic so we use the relayer's own shares)
+        ctf.mint(relayer, TOKEN_ID_YES, 5000e6);
+        vm.prank(relayer);
         ctf.setApprovalForAll(address(pool), true);
 
         uint256 maxBorrow = 2000e6;
@@ -2920,12 +3729,12 @@ contract PredmartLendingPoolTest is Test {
 
         // Step 1: deposit + borrow (first borrow → fee charged)
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, safe, relayer, 1000e6, 500e6, priceData);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 1000e6, 500e6), priceData);
         assertEq(pool.operationFeePool(), 30_000, "Fee charged on first borrow");
 
         // Step 2: deposit + borrow (subsequent → no fee)
         vm.prank(relayer);
-        pool.leverageDeposit(auth, sig, safe, relayer, 500e6, 200e6, priceData);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 200e6), priceData);
         assertEq(pool.operationFeePool(), 30_000, "No additional fee on second borrow");
     }
 
@@ -3085,16 +3894,40 @@ contract PredmartLendingPoolTest is Test {
 
         // Fast-forward to accrue interest
         vm.warp(block.timestamp + 365 days);
-        pool.accrueInterest();
+        poolAdmin.accrueInterest();
 
         // NOW totalReserves should increase (from interest, not from fees)
         assertTrue(pool.totalReserves() > reservesBefore, "Interest accrual adds to totalReserves");
     }
 }
 
-/// @notice Mock Safe that always returns false for isOwner — used to test depositCollateralFrom access control
-contract MockSafeRejectsAll {
-    function isOwner(address) external pure returns (bool) {
-        return false;
+/// @notice Mock Gnosis Safe implementing EIP-1271 `isValidSignature`.
+///         Returns the magic value (0x1626ba7e) when the signature recovers to the registered owner.
+///         Inherits ERC1155Holder so it can hold CTF shares for deposit tests.
+contract MockSafe1271 is ERC1155Holder {
+    address public owner;
+    bytes4 constant MAGIC_VALUE = 0x1626ba7e;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    function isValidSignature(bytes32 hash, bytes calldata sig) external view returns (bytes4) {
+        if (ECDSA.recover(hash, sig) == owner) return MAGIC_VALUE;
+        return 0xffffffff;
+    }
+}
+
+/// @notice Mock contract that always returns a non-magic value — simulates a malicious or broken EIP-1271 signer.
+contract MockSafe1271WrongMagic is ERC1155Holder {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return 0xdeadbeef; // Not the expected magic value
+    }
+}
+
+/// @notice Mock contract whose isValidSignature reverts — verifies SignatureChecker handles reverts gracefully.
+contract MockSafe1271Reverts is ERC1155Holder {
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        revert("isValidSignature reverted");
     }
 }

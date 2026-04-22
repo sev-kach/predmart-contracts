@@ -258,6 +258,6 @@ For a full security breakdown, see the [Security documentation](https://predmart
 
 ## License
 
-Copyright (c) 2025 PredMart. All rights reserved.
+Copyright (c) 2026 PredMart. All rights reserved.
 
 This code is made available for viewing, auditing, and non-commercial use only. Commercial use, deployment as a competing protocol, or forking for revenue-generating purposes is prohibited without prior written permission. See [LICENSE](./LICENSE) for full terms.

@@ -69,8 +69,8 @@ contract Deploy is Script {
         PredmartLendingPool implementation = new PredmartLendingPool();
         console.log("Implementation:", address(implementation));
 
-        // 2. Deploy proxy with initialization
-        bytes memory initData = abi.encodeWithSelector(PredmartLendingPool.initialize.selector, deployer);
+        // 2. Deploy proxy with initialization (function signature used directly — removed from impl after mainnet init)
+        bytes memory initData = abi.encodeWithSignature("initialize(address)", deployer);
 
         ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
         console.log("Proxy:", address(proxy));
@@ -201,8 +201,8 @@ contract Deploy is Script {
         PredmartLendingPool newImpl = new PredmartLendingPool();
         console.log("New implementation:", address(newImpl));
 
-        // upgradeToAndCall with initializeV4(relayer) — admin wallet is the relayer
-        bytes memory initData = abi.encodeWithSelector(PredmartLendingPool.initializeV4.selector, adminAddr);
+        // upgradeToAndCall with initializeV4(relayer) — admin wallet is the relayer (historical — V4 ran long ago)
+        bytes memory initData = abi.encodeWithSignature("initializeV4(address)", adminAddr);
         proxy.upgradeToAndCall(address(newImpl), initData);
 
         // Verify

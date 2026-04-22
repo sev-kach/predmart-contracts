@@ -56,6 +56,7 @@ error NoPendingChange();
 error NotRelayer();
 error NoPendingLiquidation();
 error NotLiquidator();
+error TokenFrozen();
 
 /*//////////////////////////////////////////////////////////////
                         SHARED EVENTS
@@ -68,3 +69,5 @@ event OperationFeeCollected(address indexed payer, uint256 amount);
 event OperationFeeUpdated(uint256 newFee);
 event LiquidationSettled(address indexed borrower, uint256 indexed tokenId, uint256 debtRepaid, uint256 liquidatorFee, uint256 surplus);
 event ProfitFeeCollected(address indexed borrower, uint256 indexed tokenId, uint256 poolFee, uint256 protocolFee);
+event Repaid(address indexed borrower, uint256 indexed tokenId, uint256 amount);
+event CollateralDeposited(address indexed borrower, uint256 indexed tokenId, uint256 amount);
