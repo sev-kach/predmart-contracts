@@ -1017,7 +1017,14 @@ contract PredmartPoolExtension {
             leverageNonces[auth.borrower]++;
         }
 
-        // Track BOTH user pull + advance against maxBorrow budget
+        // SECURITY: track BOTH user pull AND pool advance against maxBorrow.
+        // userAmount is NOT a field in LEVERAGE_AUTH_TYPEHASH — the relayer chooses
+        // it at TX time. The only on-chain cap on Safe-USDC extraction under this
+        // auth is `maxBorrow`. Counting userAmount here makes maxBorrow act as
+        // "max total operation size", which bounds Safe-USDC extraction even when
+        // the Safe has standing max USDC approval to the pool. DO NOT change to
+        // count only advanceAmount — that would let a compromised relayer drain
+        // the user's Safe up to the approval ceiling.
         uint256 newTotal = leverageBorrowUsed[authHash] + userAmount + advanceAmount;
         if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
         leverageBorrowUsed[authHash] = newTotal;
