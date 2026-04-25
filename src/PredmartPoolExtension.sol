@@ -701,13 +701,25 @@ contract PredmartPoolExtension {
             uint256 liquidatorFee = debt.mulDiv(PredmartPoolLib.LIQUIDATOR_FEE, 1e18);
             uint256 surplus = saleProceeds - debt;
 
-            // Fee to liquidator (msg.sender == pending.liquidator, verified above)
+            // Fee to liquidator (msg.sender == pending.liquidator, verified above).
+            // Liquidator fee is a priority payment by design (keeper-priority model):
+            // keeper compensation is guaranteed regardless of surplus depth, ensuring
+            // timely liquidations even when proceeds barely cover debt.
             if (liquidatorFee > 0) {
                 IERC20(_asset()).safeTransfer(msg.sender, liquidatorFee);
             }
 
-            // Remaining surplus stays in contract (increases totalAssets for lenders)
-            // Borrower gets $0
+            // When `liquidatorFee > surplus`, the pool nets less than `debt` after
+            // paying the keeper. Emit BadDebtAbsorbed for the shortfall so monitoring
+            // can categorize the cost consistently with the insolvent path — without
+            // this, the bleed is invisible (no event differentiates it from a clean
+            // settlement) and lenders cannot reconcile actual pool deltas.
+            if (liquidatorFee > surplus) {
+                emit BadDebtAbsorbed(borrower, tokenId, liquidatorFee - surplus);
+            }
+
+            // Remaining surplus (if any beyond the keeper fee) stays in contract
+            // (increases totalAssets for lenders). Borrower gets $0.
 
             emit LiquidationSettled(borrower, tokenId, debt, liquidatorFee, surplus);
         } else {

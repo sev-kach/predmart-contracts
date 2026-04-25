@@ -81,6 +81,7 @@ contract PredmartLendingPool is
     error InvalidIntentSignature();
     error InvalidNonce();
     error ExceedsBorrowBudget();
+    error AuthAlreadyUsed();
     error PositionHasPendingClose();
     error NoPendingClose();
     error CloseNotExpired();
@@ -270,6 +271,12 @@ contract PredmartLendingPool is
     address public pendingExtension;
     uint256 public pendingExtensionExecAfter;
 
+    // v2.4.0 — Deposit-only call tracking per LeverageAuth (replay protection for leverageDeposit(borrowAmount=0)).
+    // Without this, the deposit branch of leverageDeposit runs unconditionally for any presented signature,
+    // letting a buggy or compromised relayer pull additional Safe shares against the user's standing CTF
+    // approval as long as the auth deadline has not expired.
+    mapping(bytes32 => bool) public leverageDepositOnlyConsumed;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -329,6 +336,15 @@ contract PredmartLendingPool is
     ///      gated by the proposeAddress timelock — so this safely bypasses the setExtension
     ///      timelock for a governance-approved upgrade.
     function initializeV15(address _extension) public reinitializer(15) {
+        if (_extension == address(0)) revert InvalidAddress();
+        extension = _extension;
+        emit ExtensionUpdated(_extension);
+    }
+
+    /// @notice Atomic extension rotation for v16 upgrade.
+    /// @dev Code-only fix (initialEquity correctly reduced on borrow/withdraw to prevent
+    ///      profit-fee underpayment on mixed leverage+borrow positions). No new storage.
+    function initializeV16(address _extension) public reinitializer(16) {
         if (_extension == address(0)) revert InvalidAddress();
         extension = _extension;
         emit ExtensionUpdated(_extension);
@@ -634,17 +650,25 @@ contract PredmartLendingPool is
 
         uint256 newCollateral = pos.collateralAmount - amount;
 
-        // Verify price when: (a) user has debt (health check), or (b) relay fee is active
+        // Verify price when: (a) debt (health check), (b) relay fee active, or (c) initialEquity > 0.
+        // Case (c) is required so initialEquity can be correctly reduced by withdrawn value;
+        // without it, value extraction via withdraw would silently understate profit-fee basis.
         uint256 price;
-        if (pos.borrowShares > 0) {
+        if (pos.borrowShares > 0 || (operationFee > 0 && msg.sender == relayer) || pos.initialEquity > 0) {
             price = _verifyPriceFor(tokenId, priceData);
+        }
+        if (pos.borrowShares > 0) {
             uint256 debt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
             if (_getHealthFactor(newCollateral, debt, price) < 1e18) revert ExceedsLTV();
-        } else if (operationFee > 0 && msg.sender == relayer) {
-            price = _verifyPriceFor(tokenId, priceData);
         }
 
         pos.collateralAmount = newCollateral;
+
+        // Reduce initialEquity by USDC value of withdrawn collateral.
+        if (pos.initialEquity > 0 && price > 0) {
+            uint256 valueWithdrawn = amount.mulDiv(price, 1e18);
+            pos.initialEquity = pos.initialEquity > valueWithdrawn ? pos.initialEquity - valueWithdrawn : 0;
+        }
 
         // Collect fee in shares for relayed withdrawals.
         // If fee exceeds withdrawal, take entire withdrawal as fee (spam protection —
@@ -775,6 +799,14 @@ contract PredmartLendingPool is
         _accrueInterest();
 
         if (data.depositAmount > 0) {
+            // Deposit-only path (no borrow this round) consumes a one-shot per authHash slot.
+            // Allowed at most once per auth and never after any borrow has been formalized.
+            // Combined deposit+borrow calls (borrowAmount > 0) are gated by maxBorrow budget instead.
+            if (data.borrowAmount == 0) {
+                if (leverageBorrowUsed[authHash] > 0) revert AuthAlreadyUsed();
+                if (leverageDepositOnlyConsumed[authHash]) revert AuthAlreadyUsed();
+                leverageDepositOnlyConsumed[authHash] = true;
+            }
             _depositCollateral(auth.borrower, data.from, auth.tokenId, data.depositAmount, data.depositAmount);
         }
 
@@ -867,12 +899,19 @@ contract PredmartLendingPool is
         totalBorrowShares += shares;
         totalBorrowedPerToken[tokenId] += amount;
 
-        // Track initial equity for profit fee (non-leverage positions only).
-        // Leverage positions set initialEquity in pullUsdcForLeverage.
-        // Must be set before external transfer (CEI pattern).
+        // Track initial equity for profit fee (CEI pattern — must precede transfer).
+        // First borrow: set initialEquity to net equity (collateralValue - totalDebt).
+        // Subsequent borrows: reduce initialEquity by extracted USDC (amount - offset).
+        // The leverage-advance portion (offset) does NOT reduce initialEquity because
+        // pullUsdcForLeverage already credited userAmount; the offset is internal accounting.
         if (pos.initialEquity == 0) {
             uint256 totalDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
             pos.initialEquity = collateralValue > totalDebt ? collateralValue - totalDebt : 0;
+        } else {
+            uint256 extracted = amount > offset ? amount - offset : 0;
+            if (extracted > 0) {
+                pos.initialEquity = pos.initialEquity > extracted ? pos.initialEquity - extracted : 0;
+            }
         }
 
         // Transfer USDC (deduct operation fee + advance offset).

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test, console} from "forge-std/Test.sol";
+import {Test, console, Vm} from "forge-std/Test.sol";
 import {
     ERC1967Proxy
 } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -26,7 +26,8 @@ import {
     NotRelayer,
     NotLiquidator,
     TokenFrozen,
-    CollateralDeposited
+    CollateralDeposited,
+    BadDebtAbsorbed
 } from "../src/PredmartTypes.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockCTF} from "./mocks/MockCTF.sol";
@@ -3756,12 +3757,13 @@ contract PredmartLendingPoolTest is Test {
         assertEq(collateral, 0);
         assertEq(shares, 0);
 
-        // Borrower received surplus — no profit fee because equity (4000) > surplus (3000)
-        // equity = 5000 * 0.80 = 4000 (tracked at deposit time), surplus = 5000 - ~2000 = ~3000
-        // profit = 0 (surplus < equity), user receives full surplus
+        // v16: borrow now reduces initialEquity by extracted amount.
+        // depositCollateral: initialEquity = 5000 * 0.80 = 4000.
+        // borrow 2000: initialEquity reduced to 2000.
+        // surplus ≈ 3000, profit ≈ 1000, fee ≈ 100, user receives ≈ 2900.
         uint256 surplus = usdc.balanceOf(borrower) - borrowerBalBefore;
-        assertGt(surplus, 2_950e6, "Full surplus - no profit fee");
-        assertLt(surplus, 3_050e6);
+        assertGt(surplus, 2_850e6, "User receives surplus minus profit fee");
+        assertLt(surplus, 2_950e6);
         assertEq(pool.unsettledRedemptions(), 0, "Unsettled cleared");
     }
 
@@ -5293,17 +5295,25 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolAdmin.settleClose(borrower, TOKEN_ID_YES, saleProceeds);
 
-        // surplus = 900 - 400 = 500, equity = 800 (1000 shares * 0.80 at deposit time)
-        // profit = 0 (500 < 800 — surplus below initial equity), no fee charged
-        // user receives = 500 (full surplus)
+        // v16: borrow reduces initialEquity. depositCollateral set it to 800; borrow of 400 reduced to 400.
+        // surplus = 900 - 400 = 500, equity = 400, profit = 100, fee = 10 (7 pool + 3 protocol).
+        // user receives = 490.
         uint256 safeReceived = usdc.balanceOf(safe) - safeBalBefore;
-        uint256 expectedSurplus = saleProceeds - debt;
-        assertEq(
+        uint256 surplus = saleProceeds - debt;
+        uint256 expectedProfit = surplus - 400e6;
+        uint256 expectedFee = expectedProfit / 10;
+        assertApproxEqAbs(
             safeReceived,
-            expectedSurplus,
-            "No profit fee - surplus below initial equity"
+            surplus - expectedFee,
+            1,
+            "User receives surplus minus 10% profit fee"
         );
-        assertEq(pool.protocolFeePool(), 0, "No protocol fee when no profit");
+        assertApproxEqAbs(
+            pool.protocolFeePool(),
+            (expectedProfit * 3) / 100,
+            1,
+            "Protocol receives 3% of profit"
+        );
     }
 
     function test_settleClose_feeSkippedIfProceedsTooLow() public {
@@ -5489,6 +5499,395 @@ contract PredmartLendingPoolTest is Test {
             pool.totalReserves() > reservesBefore,
             "Interest accrual adds to totalReserves"
         );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  TEST: initialEquity REDUCTION (v16 fix)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice After deposit, a subsequent borrow that extracts USDC reduces initialEquity.
+    function test_initialEquity_reducedOnSubsequentBorrow() public {
+        _supply(lender, 50_000e6);
+
+        // Deposit 1000 shares at $0.80 → initialEquity = 800e6
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        (, , , , uint256 eqAfterDeposit) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eqAfterDeposit, 800e6, "Deposit sets initialEquity to USDC value");
+
+        // Simple borrow $300 → initialEquity reduced by 300 to 500
+        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
+            borrower: borrower, tokenId: TOKEN_ID_YES, amount: 300e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, 300e6, nonce, deadline);
+        vm.prank(relayer);
+        pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (, , , , uint256 eqAfterBorrow) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eqAfterBorrow, 500e6, "Borrow reduced initialEquity by extracted amount");
+    }
+
+    /// @notice Two successive borrows on the same position both reduce initialEquity.
+    function test_initialEquity_reducedOnEachBorrow() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 1_000e6, 200e6, 0.80e18);
+        // After: initialEquity = 800 - 200 = 600
+
+        (, , , , uint256 eqAfterFirst) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eqAfterFirst, 600e6, "First borrow: initialEquity reduced by 200");
+
+        // Second borrow $150
+        uint256 nonce = pool.borrowNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
+            borrower: borrower, tokenId: TOKEN_ID_YES, amount: 150e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signBorrowIntent(borrowerPrivateKey, borrower, TOKEN_ID_YES, 150e6, nonce, deadline);
+        vm.prank(relayer);
+        pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (, , , , uint256 eqAfterSecond) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eqAfterSecond, 450e6, "Second borrow: initialEquity reduced by 150 more");
+    }
+
+    /// @notice initialEquity is reduced by borrow up to the LTV ceiling.
+    function test_initialEquity_borrowReducesUpToLTV() public {
+        _supply(lender, 50_000e6);
+        // Deposit 1000 at $1.00 → initialEquity = 1000, LTV 75% → max borrow 750.
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 1_000e6, 700e6, 1.00e18);
+        (, , , , uint256 eq) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eq, 300e6, "Borrow of 700 from initialEquity 1000 leaves 300");
+    }
+
+    /// @notice Withdrawing collateral reduces initialEquity by USDC value of withdrawn shares.
+    function test_initialEquity_reducedOnWithdraw() public {
+        _supply(lender, 50_000e6);
+
+        // Deposit 1000 shares at $0.80 → initialEquity = 800. No debt.
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        // Withdraw 200 shares via relay (worth $160 at $0.80).
+        uint256 nonce = pool.withdrawNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signWithdrawIntent(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 200e6, nonce, deadline
+        );
+        PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool.WithdrawIntent({
+            borrower: borrower, to: borrower, tokenId: TOKEN_ID_YES, amount: 200e6, nonce: nonce, deadline: deadline
+        });
+        vm.prank(relayer);
+        pool.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (, , , , uint256 eq) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eq, 640e6, "Withdraw reduced initialEquity by withdrawn USDC value");
+    }
+
+    /// @notice End-to-end: simple borrow after deposit changes profit fee correctly on close.
+    function test_initialEquity_profitFeeCorrectAfterBorrow() public {
+        _supply(lender, 50_000e6);
+        // Deposit 1000 at $0.80 → initialEquity = 800. Borrow 400 → equity = 400.
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 1_000e6, 400e6, 0.80e18);
+
+        uint256 debt = pool.getPositionDebt(borrower, TOKEN_ID_YES);
+        (
+            PredmartPoolExtension.CloseAuth memory auth,
+            bytes memory sig,
+            PredmartOracle.PriceData memory priceData
+        ) = _buildAndSignCloseAuth(TOKEN_ID_YES, 0.80e18);
+        vm.prank(relayer);
+        poolAdmin.initiateClose(auth, sig, priceData);
+
+        // Sell at $0.90: saleProceeds = 900, surplus = 500.
+        // After fix: equity = 400, profit = 100, fee = 10 (7 pool + 3 protocol), user gets 490.
+        uint256 safeBalBefore = usdc.balanceOf(safe);
+        uint256 protoBefore = pool.protocolFeePool();
+        vm.prank(relayer);
+        poolAdmin.settleClose(borrower, TOKEN_ID_YES, 900e6);
+
+        uint256 safeReceived = usdc.balanceOf(safe) - safeBalBefore;
+        uint256 expectedSurplusBeforeFee = 900e6 - debt;
+        // profit = expectedSurplusBeforeFee - reducedEquity (400)
+        uint256 expectedProfit = expectedSurplusBeforeFee - 400e6;
+        uint256 expectedFeeTotal = expectedProfit / 10; // 10% total
+        assertApproxEqAbs(
+            safeReceived,
+            expectedSurplusBeforeFee - expectedFeeTotal,
+            1,
+            "User receives surplus minus 10% profit fee"
+        );
+        assertApproxEqAbs(
+            pool.protocolFeePool() - protoBefore,
+            (expectedProfit * 3) / 100, // 3% protocol
+            1,
+            "Protocol receives 3% of profit"
+        );
+    }
+
+    /*//////////////////////////////////////////////////////////////
+            TEST: leverageDeposit deposit-only replay (v16 fix)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice First deposit-only call against a fresh authHash succeeds and adds collateral.
+    function test_leverageDepositOnly_firstCallSucceeds() public {
+        _supply(lender, 50_000e6);
+        ctf.mint(relayer, TOKEN_ID_YES, 1_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 100e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower, allowedFrom: safe, tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(
+            borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (uint256 collateral, , , , ) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 600e6, "100 initial + 500 deposited");
+    }
+
+    /// @notice Second deposit-only call against the same authHash reverts AuthAlreadyUsed.
+    function test_leverageDepositOnly_replayReverts() public {
+        _supply(lender, 50_000e6);
+        ctf.mint(relayer, TOKEN_ID_YES, 2_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 100e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower, allowedFrom: safe, tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(
+            borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        // First deposit-only call succeeds.
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Second deposit-only call with the same auth must revert.
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.AuthAlreadyUsed.selector);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /// @notice Deposit-only call after a borrow has been formalized reverts AuthAlreadyUsed.
+    function test_leverageDepositOnly_revertsAfterBorrow() public {
+        _supply(lender, 50_000e6);
+        ctf.mint(relayer, TOKEN_ID_YES, 3_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower, allowedFrom: safe, tokenId: TOKEN_ID_YES,
+            maxBorrow: 2_000e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(
+            borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 2_000e6, nonce, deadline
+        );
+
+        // First call: deposit + borrow combined.
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 1_000e6, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Subsequent deposit-only call with the same auth must revert.
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.AuthAlreadyUsed.selector);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /// @notice Path 1 (pre-deposit then deposit+borrow) still works under the new gate.
+    function test_leverageDepositOnly_path1StillWorks() public {
+        _supply(lender, 50_000e6);
+        ctf.mint(relayer, TOKEN_ID_YES, 2_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 100e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower, allowedFrom: safe, tokenId: TOKEN_ID_YES,
+            maxBorrow: 1_000e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(
+            borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 1_000e6, nonce, deadline
+        );
+
+        // Pre-deposit: deposit-only.
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 500e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // Combined deposit + borrow with the same auth — must succeed (gate skipped because borrowAmount > 0).
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 1_000e6, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (uint256 collateral, uint256 borrowShares, , , ) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(collateral, 1_600e6, "100 initial + 500 pre + 1000 main = 1600");
+        assertGt(borrowShares, 0, "Borrow formalized");
+    }
+
+    /// @notice Combined deposit+borrow path is not gated by the deposit-only flag,
+    /// and a subsequent deposit-only call still reverts (caught by the borrow-already-used branch).
+    function test_leverageDepositOnly_combinedCallNotGated() public {
+        _supply(lender, 50_000e6);
+        ctf.mint(relayer, TOKEN_ID_YES, 1_000e6);
+        vm.prank(relayer);
+        ctf.setApprovalForAll(address(pool), true);
+
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.leverageNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool.LeverageAuth({
+            borrower: borrower, allowedFrom: safe, tokenId: TOKEN_ID_YES,
+            maxBorrow: 2_000e6, nonce: nonce, deadline: deadline
+        });
+        bytes memory sig = _signLeverageAuth(
+            borrowerPrivateKey, borrower, safe, TOKEN_ID_YES, 2_000e6, nonce, deadline
+        );
+
+        // Combined call succeeds.
+        vm.prank(relayer);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 1_000e6, 500e6), _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        // A follow-up deposit-only call reverts because borrow has already been recorded.
+        vm.prank(relayer);
+        vm.expectRevert(PredmartLendingPool.AuthAlreadyUsed.selector);
+        pool.leverageDeposit(auth, sig, "", _ldd(relayer, relayer, 100e6, 0), _signPrice(TOKEN_ID_YES, 0.80e18));
+    }
+
+    /// @notice Smaller withdraw with relay reduces initialEquity proportional to withdrawn value.
+    function test_initialEquity_smallerWithdraw() public {
+        _supply(lender, 50_000e6);
+        vm.startPrank(borrower);
+        ctf.setApprovalForAll(address(pool), true);
+        poolAdmin.depositCollateral(TOKEN_ID_YES, 1_000e6, _signPrice(TOKEN_ID_YES, 0.80e18));
+        vm.stopPrank();
+
+        uint256 nonce = pool.withdrawNonces(borrower);
+        uint256 deadline = block.timestamp + 300;
+        bytes memory sig = _signWithdrawIntent(
+            borrowerPrivateKey, borrower, borrower, TOKEN_ID_YES, 100e6, nonce, deadline
+        );
+        PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool.WithdrawIntent({
+            borrower: borrower, to: borrower, tokenId: TOKEN_ID_YES, amount: 100e6, nonce: nonce, deadline: deadline
+        });
+        vm.prank(relayer);
+        pool.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
+
+        (, , , , uint256 eq) = pool.positions(borrower, TOKEN_ID_YES);
+        assertEq(eq, 720e6, "100 shares * $0.80 = 80 reduction; 800 - 80 = 720");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+       TEST: settleLiquidation fee shortfall visibility (Finding #7)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice When the liquidator fee exceeds available surplus, the pool nets less
+    /// than `debt`. The fix emits BadDebtAbsorbed for the shortfall so monitoring can
+    /// track it consistently with the insolvent path.
+    function test_settleLiquidation_FeeShortfall_EmitsBadDebt() public {
+        _supply(lender, 50_000e6);
+        // Deposit 1000 shares at $0.80 (collateral value $800). LTV at 0.80 = 70% → max borrow $560.
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 1_000e6, 500e6, 0.80e18);
+
+        // Crash price to $0.50 (collateral value $500, max borrow $300 → underwater).
+        PredmartOracle.PriceData memory crashPrice = _signPrice(TOKEN_ID_YES, 0.50e18);
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, crashPrice);
+
+        // _depositAndBorrow borrows 500e6 immediately; pendingLiquidations.debt at this
+        // instant ≈ 500e6 + accrued (negligible — same block).
+        uint256 approxDebt = 500e6;
+        uint256 liquidatorFee = (approxDebt * 5) / 100; // 5% of debt = 25e6
+
+        // Choose saleProceeds so that surplus (proceeds - debt) is LESS than the fee.
+        // Set surplus = 5e6 → fee 25e6 > surplus 5e6 → shortfall = 20e6.
+        uint256 saleProceeds = approxDebt + 5e6;
+        uint256 expectedShortfall = liquidatorFee - 5e6; // 20e6
+
+        vm.prank(liquidator);
+        usdc.approve(address(pool), saleProceeds);
+
+        vm.expectEmit(true, true, false, true);
+        emit BadDebtAbsorbed(borrower, TOKEN_ID_YES, expectedShortfall);
+
+        vm.prank(liquidator);
+        poolAdmin.settleLiquidation(borrower, TOKEN_ID_YES, saleProceeds);
+    }
+
+    /// @notice When surplus exceeds the liquidator fee, the pool is whole and no
+    /// BadDebtAbsorbed event should fire. Sanity check that the new branch only
+    /// triggers in the actual shortfall window.
+    function test_settleLiquidation_NoShortfall_NoBadDebt() public {
+        _supply(lender, 50_000e6);
+        _depositAndBorrow(borrower, TOKEN_ID_YES, 1_000e6, 500e6, 0.80e18);
+
+        PredmartOracle.PriceData memory crashPrice = _signPrice(TOKEN_ID_YES, 0.50e18);
+        vm.prank(liquidator);
+        poolAdmin.liquidate(borrower, TOKEN_ID_YES, crashPrice);
+
+        uint256 approxDebt = 500e6;
+        // Choose saleProceeds so surplus comfortably exceeds the 5% fee.
+        // surplus = 100e6, fee = 25e6 → no shortfall.
+        uint256 saleProceeds = approxDebt + 100e6;
+
+        vm.prank(liquidator);
+        usdc.approve(address(pool), saleProceeds);
+
+        // Record logs and verify no BadDebtAbsorbed event was emitted.
+        vm.recordLogs();
+        vm.prank(liquidator);
+        poolAdmin.settleLiquidation(borrower, TOKEN_ID_YES, saleProceeds);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 badDebtSig = keccak256("BadDebtAbsorbed(address,uint256,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(
+                logs[i].topics[0] != badDebtSig,
+                "BadDebtAbsorbed should NOT fire when surplus exceeds liquidator fee"
+            );
+        }
     }
 }
 
