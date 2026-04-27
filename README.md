@@ -41,7 +41,7 @@ The protocol is split across two contracts that share a single proxy address:
 - **ERC-4626 Vault** — manages lender USDC deposits, mints/burns pUSDC shares, and distributes yield
 - **Collateral Manager** — tracks per-user, per-token ERC-1155 collateral deposits and loan positions
 - **Meta-Transaction Relayer** — all borrow, withdraw, and leverage operations use EIP-712 signed intents submitted by a trusted relayer, eliminating the need for users to hold gas tokens
-- **Leverage Engine** — users sign a single `LeverageAuth` message authorizing a maximum borrow budget. The relayer calls `pullUsdcForLeverage` to pull user USDC + pool advance, buys shares on the CLOB, then calls `leverageDeposit` to deposit all shares as collateral and formalize the advance as debt. The entire operation is bounded by the user-signed `maxBorrow` budget
+- **Leverage Engine** — users sign a single `LeverageAuth` message authorizing a maximum borrow budget. The `PredmartLeverageModule` (a Gnosis Safe Module enabled on the user's Safe during onboarding) verifies the signature, pulls the user's equity from the Safe to the relayer, and calls `pullUsdcForLeverage` to record accounting and advance the borrowed USDC — all atomically in one transaction. The relayer then buys shares on the CLOB and calls `leverageDeposit` to deposit all shares as collateral and formalize the advance as debt. The entire operation is bounded by the user-signed `maxBorrow` budget
 - **Flash Close Engine** — `initiateClose()` + `settleClose()` enable single-signature position closing: user signs a `CloseAuth`, the relayer zeros debt, transfers all shares to itself, sells on CLOB, and settles with proceeds. Profit fees are deducted automatically during settlement
 - **Interest Rate Model** — kinked utilization-based curve: 10% base APR at zero utilization, rising to 42% at 80% utilization (kink), then sharply to 317% max to incentivize liquidity
 - **Profit Fee** — 10% fee on borrower profit at position close, split 7% to the lending pool (increases lender yield) and 3% to the protocol. Only charged when the borrower's surplus exceeds their initial equity investment
@@ -52,13 +52,22 @@ The protocol is split across two contracts that share a single proxy address:
 
 **`PredmartPoolExtension`** — admin governance, market resolution, and liquidation settlement, called via `delegatecall` from the main contract's `fallback()`:
 
-- **Timelocked Admin Functions** — propose/execute changes to oracle, relayer, risk anchors, and contract upgrades
+- **Timelocked Admin Functions** — propose/execute changes to oracle, relayer, risk anchors, leverage module, and contract upgrades
 - **Market Resolution** — permissionless functions to resolve Polymarket markets, close positions on resolved markets, redeem winning CTF shares for USDC, and settle borrower positions with pro-rata surplus distribution
 - **Liquidation Settlement** — `settleLiquidation()` processes CLOB sale proceeds after collateral seizure, distributing debt repayment, liquidator fee, and handling bad debt absorption
 - **Fee Management** — `withdrawOperationFees()` and `withdrawFeeShares()` callable by both admin and relayer for automated gas top-up; `withdrawProtocolFees()` for admin to collect protocol's profit fee share
 - **Inline Helpers** — duplicates of internal interest accrual and borrow tracking functions (required because the extension cannot call the main contract's `internal` functions via delegatecall)
 
 Both contracts share an identical storage layout to ensure safe delegatecall execution.
+
+**`PredmartLeverageModule`** — a standalone Gnosis Safe Module deployed at its own address (not behind the proxy). Users enable this module on their Safe during onboarding, granting it the privilege to pull USDC from the Safe via `execTransactionFromModule` for the duration of a leverage open. The module:
+
+- Verifies the borrower's EIP-712 `LeverageAuth` signature against the pool's domain separator
+- Verifies the borrower is an owner of the Safe
+- Pulls `userAmount` USDC from the Safe to the relayer in a single `execTransactionFromModule` call
+- Calls the pool's `pullUsdcForLeverage(auth, userAmount, advanceAmount)` to consume the leverage nonce, enforce the `maxBorrow` budget, track initial equity, and advance the borrowed USDC to the relayer
+
+The pool restricts `pullUsdcForLeverage` to the address registered as `leverageModule`, making this module the sole authorized caller. The module's address is wired into pool storage via `initializeV17` during the upgrade that enables this flow, and rotated thereafter through a timelocked `proposeLeverageModule` / `executeLeverageModule` pair.
 
 ### Oracle Design
 
@@ -70,7 +79,7 @@ Users never submit transactions directly. Instead, they sign EIP-712 typed data 
 
 - **BorrowIntent** — signed by the borrower, specifies amount, token, and destination
 - **WithdrawIntent** — signed by the borrower, specifies amount, token, and withdrawal destination
-- **LeverageAuth** — signed once per leverage operation, authorizes a cumulative borrow budget with an explicit `allowedFrom` address (user's Gnosis Safe) where USDC is sent
+- **LeverageAuth** — signed once per leverage operation, authorizes a cumulative borrow budget with an explicit `allowedFrom` address (user's Gnosis Safe). The `PredmartLeverageModule` verifies this signature on-chain and is the sole authorized caller of the pool's `pullUsdcForLeverage` function, so no separate Safe-side approval is required at trade time
 - **CloseAuth** — signed once per flash close or TP/SL order, authorizes the relayer to close a specific position and settle with CLOB sale proceeds
 
 ### Upgradeability
@@ -86,13 +95,16 @@ predmart-contracts/
 ├── src/
 │   ├── PredmartLendingPool.sol     # Core lending pool (ERC-4626 + collateral + leverage + liquidation)
 │   ├── PredmartPoolExtension.sol   # Admin governance + market resolution + liquidation settlement
+│   ├── PredmartLeverageModule.sol  # Gnosis Safe Module for atomic leverage opens (verifies auth, pulls Safe USDC, calls pool)
 │   ├── PredmartPoolLib.sol         # Interest rate model + liquidation math + profit fee calc
 │   ├── PredmartOracle.sol          # Oracle signature verification helpers
 │   ├── PredmartTypes.sol           # Shared structs (Position, PendingClose, PendingLiquidation)
 │   └── interfaces/
-│       └── ICTF.sol                # Interface for Polymarket's CTF ERC-1155 contract
+│       ├── ICTF.sol                # Interface for Polymarket's CTF ERC-1155 contract
+│       └── INegRiskAdapter.sol     # Interface for Polymarket's NegRisk adapter
 ├── test/
 │   ├── PredmartLendingPool.t.sol   # Comprehensive test suite (Foundry)
+│   ├── PredmartLeverageModule.t.sol # Module-specific tests
 │   └── mocks/
 │       ├── MockUSDC.sol            # Mock ERC-20 USDC for testing
 │       └── MockCTF.sol             # Mock ERC-1155 CTF token for testing

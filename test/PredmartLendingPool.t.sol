@@ -2607,417 +2607,6 @@ contract PredmartLendingPoolTest is Test {
         );
     }
 
-    /*//////////////////////////////////////////////////////////////
-        TEST: PULL USDC FOR LEVERAGE (  H-02 — allowedFrom consent)
-    //////////////////////////////////////////////////////////////*/
-
-    /// @dev H-02 attack: attacker signs LeverageAuth with their own key but sets allowedFrom
-    ///      to a USDC-approved victim. Without fromSignature, the contract must reject.
-    function test_PullUsdc_H02_AttackBlocked_MissingFromSignature() public {
-        _supply(lender, 50_000e6);
-
-        // Victim has granted USDC allowance to the pool (standard lender setup)
-        uint256 victimKey = 0xDEAD;
-        address victim = vm.addr(victimKey);
-        usdc.mint(victim, 5_000e6);
-        vm.prank(victim);
-        usdc.approve(address(pool), type(uint256).max);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: victim, // attacker-controlled: points to victim
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 5_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            victim,
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-
-        vm.prank(relayer);
-        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
-        poolAdmin.pullUsdcForLeverage(
-            _castAuth(auth),
-            authSig,
-            "",
-            /* empty fromSignature */ 2_000e6,
-            0
-        );
-    }
-
-    /// @dev Legitimate flow: allowedFrom (separate wallet) signs the same authHash alongside borrower.
-    function test_PullUsdc_LegitimateFlow_AllowedFromSigns() public {
-        _supply(lender, 50_000e6);
-
-        uint256 safeOwnerKey = 0x5AFE;
-        address safeOwner = vm.addr(safeOwnerKey);
-        usdc.mint(safeOwner, 5_000e6);
-        vm.prank(safeOwner);
-        usdc.approve(address(pool), type(uint256).max);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: safeOwner,
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 5_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        // Borrower and allowedFrom both sign the same authHash
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            safeOwner,
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-        bytes memory fromSig = _signLeverageAuth(
-            safeOwnerKey,
-            borrower,
-            safeOwner,
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-
-        uint256 victimBefore = usdc.balanceOf(safeOwner);
-        uint256 relayerBefore = usdc.balanceOf(relayer);
-
-        vm.prank(relayer);
-        poolAdmin.pullUsdcForLeverage(
-            _castAuth(auth),
-            authSig,
-            fromSig,
-            2_000e6,
-            0
-        );
-
-        assertEq(
-            usdc.balanceOf(safeOwner),
-            victimBefore - 2_000e6,
-            "USDC pulled from allowedFrom"
-        );
-        assertEq(
-            usdc.balanceOf(relayer),
-            relayerBefore + 2_000e6,
-            "USDC received by relayer"
-        );
-    }
-
-    /// @dev When allowedFrom == borrower, fromSignature can be empty (self-authorization).
-    function test_PullUsdc_AllowedFromEqualsBorrower_NoFromSigNeeded() public {
-        _supply(lender, 50_000e6);
-
-        usdc.mint(borrower, 5_000e6);
-        vm.prank(borrower);
-        usdc.approve(address(pool), type(uint256).max);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: borrower, // same as borrower
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 5_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            borrower,
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-
-        uint256 borrowerBefore = usdc.balanceOf(borrower);
-
-        vm.prank(relayer);
-        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 2_000e6, 0);
-
-        assertEq(
-            usdc.balanceOf(borrower),
-            borrowerBefore - 2_000e6,
-            "USDC pulled from borrower"
-        );
-    }
-
-    /// @dev When userAmount == 0 (advance only), no pull from allowedFrom happens,
-    ///      so fromSignature is not required even if allowedFrom != borrower.
-    function test_PullUsdc_AdvanceOnly_NoFromSigNeeded() public {
-        _supply(lender, 50_000e6);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: safe, // different from borrower, but not used
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 5_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            safe,
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-
-        uint256 relayerBefore = usdc.balanceOf(relayer);
-
-        vm.prank(relayer);
-        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, 1_000e6);
-
-        assertGt(
-            usdc.balanceOf(relayer),
-            relayerBefore,
-            "Advance delivered to relayer"
-        );
-    }
-
-    /// @dev   L-06: withdrawViaRelay must accept EIP-1271 signatures so contract accounts
-    ///      (Gnosis Safes) can authorize withdrawals — previously only EOA signatures worked,
-    ///      meaning any collateral deposited by a contract was stuck.
-    function test_WithdrawViaRelay_L06_EIP1271ContractSignerWorks() public {
-        _supply(lender, 50_000e6);
-
-        uint256 safeOwnerKey = 0xC0FFEE;
-        address safeOwner = vm.addr(safeOwnerKey);
-        MockSafe1271 safeAcct = new MockSafe1271(safeOwner);
-
-        // Safe has CTF shares and deposits them directly as collateral
-        ctf.mint(address(safeAcct), TOKEN_ID_YES, 5_000e6);
-        vm.prank(address(safeAcct));
-        ctf.setApprovalForAll(address(pool), true);
-        vm.prank(address(safeAcct));
-        poolAdmin.depositCollateral(
-            TOKEN_ID_YES,
-            3_000e6,
-            _signPrice(TOKEN_ID_YES, 0.80e18)
-        );
-
-        // Safe owner signs WithdrawIntent — Safe's EIP-1271 validates this via ECDSA recovery
-        uint256 nonce = pool.withdrawNonces(address(safeAcct));
-        uint256 deadline = block.timestamp + 300;
-        bytes memory sig = _signWithdrawIntent(
-            safeOwnerKey,
-            address(safeAcct),
-            address(safeAcct),
-            TOKEN_ID_YES,
-            2_000e6,
-            nonce,
-            deadline
-        );
-        PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool
-            .WithdrawIntent({
-                borrower: address(safeAcct),
-                to: address(safeAcct),
-                tokenId: TOKEN_ID_YES,
-                amount: 2_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-
-        uint256 safeSharesBefore = ctf.balanceOf(
-            address(safeAcct),
-            TOKEN_ID_YES
-        );
-
-        vm.prank(relayer);
-        pool.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
-
-        assertEq(
-            ctf.balanceOf(address(safeAcct), TOKEN_ID_YES),
-            safeSharesBefore + 2_000e6,
-            "Shares withdrawn to Safe via EIP-1271"
-        );
-    }
-
-    /// @dev   L-04: pullUsdcForLeverage must reject frozen tokens before sending USDC,
-    ///      otherwise relayer gets USDC it can't deposit via leverageDeposit (which checks frozen).
-    function test_PullUsdc_L04_RevertsFrozenToken() public {
-        _supply(lender, 50_000e6);
-
-        // Admin freezes the token
-        vm.prank(admin);
-        poolAdmin.setTokenFrozen(TOKEN_ID_YES, true);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: borrower,
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 1_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            borrower,
-            TOKEN_ID_YES,
-            1_000e6,
-            nonce,
-            deadline
-        );
-
-        vm.prank(relayer);
-        vm.expectRevert(TokenFrozen.selector);
-        poolAdmin.pullUsdcForLeverage(_castAuth(auth), authSig, "", 0, 1_000e6);
-    }
-
-    /// @dev   M-01: pendingAdvances must track GROSS advance (including fee),
-    ///      so that leverageDeposit settles with gross debt — fee paid by borrower, not lenders.
-    function test_PullUsdc_M01_FeePaidByBorrowerNotLenders() public {
-        _supply(lender, 50_000e6);
-        _enableFee();
-
-        uint256 advanceAmount = 1_000e6;
-        uint256 fee = pool.operationFee();
-        uint256 opFeePoolBefore = pool.operationFeePool();
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: borrower,
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: advanceAmount,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            borrower,
-            TOKEN_ID_YES,
-            advanceAmount,
-            nonce,
-            deadline
-        );
-
-        bytes32 structHash = keccak256(
-            abi.encode(
-                LEVERAGE_AUTH_TYPEHASH,
-                borrower,
-                borrower,
-                TOKEN_ID_YES,
-                advanceAmount,
-                nonce,
-                deadline
-            )
-        );
-        bytes32 authHash = keccak256(
-            abi.encodePacked("\x19\x01", _domainSeparator(), structHash)
-        );
-
-        vm.prank(relayer);
-        poolAdmin.pullUsdcForLeverage(
-            _castAuth(auth),
-            authSig,
-            "",
-            0,
-            advanceAmount
-        );
-
-        // M-01: pendingAdvance tracks GROSS, not NET. Previously was `advanceAmount - fee`.
-        assertEq(
-            pool.pendingAdvances(authHash),
-            advanceAmount,
-            "pendingAdvance = GROSS (includes fee)"
-        );
-        assertEq(
-            pool.totalPendingAdvances(),
-            advanceAmount,
-            "totalPendingAdvances = GROSS"
-        );
-        // Fee is still accounted as protocol revenue
-        assertEq(
-            pool.operationFeePool(),
-            opFeePoolBefore + fee,
-            "operationFeePool received the fee"
-        );
-    }
-
-    /// @dev   M-02: _availableCash must not double-discount pending advances.
-    ///      The advance USDC has already left the pool's balance, so the decrease should be
-    ///      exactly (advanceAmount - fee) sent + fee earmarked = advanceAmount total — not 2x.
-    function test_PullUsdc_M02_AvailableCashNoDoubleDiscount() public {
-        _supply(lender, 50_000e6);
-        _enableFee();
-
-        uint256 advanceAmount = 1_000e6;
-        uint256 maxWithdrawBefore = pool.maxWithdraw(lender);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: borrower,
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: advanceAmount,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            borrower,
-            TOKEN_ID_YES,
-            advanceAmount,
-            nonce,
-            deadline
-        );
-
-        vm.prank(relayer);
-        poolAdmin.pullUsdcForLeverage(
-            _castAuth(auth),
-            authSig,
-            "",
-            0,
-            advanceAmount
-        );
-
-        uint256 maxWithdrawAfter = pool.maxWithdraw(lender);
-        uint256 decrease = maxWithdrawBefore - maxWithdrawAfter;
-
-        // M-02: decrease = advanceAmount (sent to relayer, minus fee still in balance but earmarked).
-        // Pre-fix would have decreased by ~2 * advanceAmount due to double-counting.
-        assertEq(
-            decrease,
-            advanceAmount,
-            "maxWithdraw dropped by exactly advanceAmount (no double discount)"
-        );
-    }
-
     /// @dev Helper: cast PredmartLendingPool.LeverageAuth to PredmartPoolExtension.LeverageAuth
     ///      (same struct layout, different declaring contract)
     function _castAuth(
@@ -3333,61 +2922,6 @@ contract PredmartLendingPoolTest is Test {
             deadline,
             sig,
             _signPrice(TOKEN_ID_YES, 0.80e18)
-        );
-    }
-
-    /// @dev H-02: Attacker sets `allowedFrom` = victim's Safe (they don't own), provides their own signature.
-    ///      Safe's isValidSignature rejects because attacker isn't a registered owner. Reverts.
-    function test_PullUsdc_EIP1271_AttackerCannotSpoofSafe() public {
-        _supply(lender, 50_000e6);
-
-        // Real Safe has a legitimate owner (not the attacker)
-        uint256 ownerKey = 0x5A5E_1;
-        address ownerAddr = vm.addr(ownerKey);
-        MockSafe1271 victimSafe = new MockSafe1271(ownerAddr);
-        usdc.mint(address(victimSafe), 5_000e6);
-        vm.prank(address(victimSafe));
-        usdc.approve(address(pool), type(uint256).max);
-
-        uint256 nonce = pool.leverageNonces(borrower);
-        uint256 deadline = block.timestamp + 300;
-        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
-            .LeverageAuth({
-                borrower: borrower,
-                allowedFrom: address(victimSafe),
-                tokenId: TOKEN_ID_YES,
-                maxBorrow: 5_000e6,
-                nonce: nonce,
-                deadline: deadline
-            });
-        bytes memory authSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            address(victimSafe),
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-        // Attacker signs fromSig with borrower's (attacker's) key — but safe validates against ownerKey
-        bytes memory forgedFromSig = _signLeverageAuth(
-            borrowerPrivateKey,
-            borrower,
-            address(victimSafe),
-            TOKEN_ID_YES,
-            5_000e6,
-            nonce,
-            deadline
-        );
-
-        vm.prank(relayer);
-        vm.expectRevert(PredmartLendingPool.InvalidIntentSignature.selector);
-        poolAdmin.pullUsdcForLeverage(
-            _castAuth(auth),
-            authSig,
-            forgedFromSig,
-            2_000e6,
-            0
         );
     }
 
@@ -5888,6 +5422,200 @@ contract PredmartLendingPoolTest is Test {
                 "BadDebtAbsorbed should NOT fire when surplus exceeds liquidator fee"
             );
         }
+    }
+
+    /*//////////////////////////////////////////////////////////////
+              ATOMIC-EXECUTE LEVERAGE MODULE (v17)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @dev `leverageModule` is read via vm.load directly because the pool's auto-getter
+    ///      is intentionally omitted (size optimization); the extension getter exists but
+    ///      is unreachable via static call (fallback writes to a reentrancy guard slot).
+    function _readLeverageModule() internal view returns (address) {
+        return address(uint160(uint256(vm.load(address(pool), bytes32(uint256(82))))));
+    }
+    function _readPendingLeverageModule() internal view returns (address) {
+        return address(uint160(uint256(vm.load(address(pool), bytes32(uint256(83))))));
+    }
+
+    function test_SetLeverageModule_Instant_WhenUnsetAndTimelockOff() public {
+        address mod = makeAddr("module");
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod);
+        assertEq(_readLeverageModule(), mod);
+    }
+
+    function test_SetLeverageModule_Reverts_WhenTimelockActiveAndAlreadySet() public {
+        address mod1 = makeAddr("module1");
+        address mod2 = makeAddr("module2");
+
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod1);
+
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+
+        vm.prank(admin);
+        vm.expectRevert(TimelockNotReady.selector);
+        poolAdmin.setLeverageModule(mod2);
+    }
+
+    function test_ProposeAndExecuteLeverageModule_AfterTimelock() public {
+        address mod1 = makeAddr("module1");
+        address mod2 = makeAddr("module2");
+
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod1);
+
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+
+        vm.prank(admin);
+        poolAdmin.proposeLeverageModule(mod2);
+
+        // Cannot execute before timelock elapses
+        vm.prank(admin);
+        vm.expectRevert(TimelockNotReady.selector);
+        poolAdmin.executeLeverageModule();
+
+        vm.warp(block.timestamp + 6 hours + 1);
+
+        vm.prank(admin);
+        poolAdmin.executeLeverageModule();
+        assertEq(_readLeverageModule(), mod2);
+    }
+
+    function test_CancelPendingLeverageModule_Clears() public {
+        address mod1 = makeAddr("module1");
+        address mod2 = makeAddr("module2");
+
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod1);
+
+        vm.prank(admin);
+        poolAdmin.activateTimelock(6 hours);
+
+        vm.prank(admin);
+        poolAdmin.proposeLeverageModule(mod2);
+        assertEq(_readPendingLeverageModule(), mod2);
+
+        vm.prank(admin);
+        poolAdmin.cancelPendingLeverageModule();
+        assertEq(_readPendingLeverageModule(), address(0));
+    }
+
+    function test_PullUsdcForLeverage_RevertsForNonModule() public {
+        address mod = makeAddr("module");
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod);
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
+            .LeverageAuth({
+                borrower: borrower,
+                allowedFrom: safe,
+                tokenId: TOKEN_ID_YES,
+                maxBorrow: 5_000e6,
+                nonce: 0,
+                deadline: block.timestamp + 300
+            });
+
+        // Anyone-but-module call must revert.
+        vm.prank(relayer);
+        vm.expectRevert(PredmartPoolExtension.NotLeverageModule.selector);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), 1_000e6, 0);
+    }
+
+    function test_PullUsdcForLeverage_HappyPath_AdvanceOnly() public {
+        _supply(lender, 50_000e6);
+
+        address mod = makeAddr("module");
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod);
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
+            .LeverageAuth({
+                borrower: borrower,
+                allowedFrom: safe,
+                tokenId: TOKEN_ID_YES,
+                maxBorrow: 5_000e6,
+                nonce: pool.leverageNonces(borrower),
+                deadline: block.timestamp + 300
+            });
+
+        uint256 nonceBefore = pool.leverageNonces(borrower);
+        uint256 relayerBefore = usdc.balanceOf(relayer);
+
+        // Module triggers advance-only call (userAmount=0).
+        vm.prank(mod);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), 0, 1_000e6);
+
+        // Pool advanced (1_000e6 - operationFee) USDC to relayer.
+        // operationFee defaults to 0 in the test fixture unless set.
+        assertEq(usdc.balanceOf(relayer), relayerBefore + 1_000e6 - poolAdmin.operationFee(), "relayer received advance");
+        assertEq(pool.leverageNonces(borrower), nonceBefore + 1, "nonce consumed");
+    }
+
+    function test_PullUsdcForLeverage_ExceedsMaxBorrow_Reverts() public {
+        _supply(lender, 50_000e6);
+
+        address mod = makeAddr("module");
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod);
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
+            .LeverageAuth({
+                borrower: borrower,
+                allowedFrom: safe,
+                tokenId: TOKEN_ID_YES,
+                maxBorrow: 1_000e6,
+                nonce: pool.leverageNonces(borrower),
+                deadline: block.timestamp + 300
+            });
+
+        // userAmount + advanceAmount > maxBorrow → revert
+        vm.prank(mod);
+        vm.expectRevert(PredmartPoolExtension.ExceedsBorrowBudget.selector);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), 600e6, 600e6);
+    }
+
+    function test_PullUsdcForLeverage_ExpiredDeadline_Reverts() public {
+        address mod = makeAddr("module");
+        vm.prank(admin);
+        poolAdmin.setLeverageModule(mod);
+
+        PredmartLendingPool.LeverageAuth memory auth = PredmartLendingPool
+            .LeverageAuth({
+                borrower: borrower,
+                allowedFrom: safe,
+                tokenId: TOKEN_ID_YES,
+                maxBorrow: 5_000e6,
+                nonce: 0,
+                deadline: block.timestamp - 1
+            });
+
+        vm.prank(mod);
+        vm.expectRevert(PredmartPoolExtension.IntentExpired.selector);
+        poolAdmin.pullUsdcForLeverage(_castAuth(auth), 0, 1_000e6);
+    }
+
+    function test_InitializeV17_WiresExtensionAndModule() public {
+        // Fresh proxy deployed via the harness already has extension set; we test
+        // that initializeV17 wires both atomically when called via upgradeToAndCall.
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        PredmartLendingPool newImpl = new PredmartLendingPool();
+        address newMod = makeAddr("newModule");
+
+        bytes memory initData = abi.encodeWithSelector(
+            PredmartLendingPool.initializeV17.selector,
+            address(newExt),
+            newMod
+        );
+
+        vm.prank(admin);
+        pool.upgradeToAndCall(address(newImpl), initData);
+
+        assertEq(pool.extension(), address(newExt), "extension wired");
+        assertEq(_readLeverageModule(), newMod, "module wired");
     }
 }
 

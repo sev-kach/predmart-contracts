@@ -190,6 +190,15 @@ contract PredmartPoolExtension {
     address public pendingExtension;
     uint256 public pendingExtensionExecAfter;
 
+    // v2.4.0 — Deposit-only call replay tracking (MUST mirror PredmartLendingPool storage layout)
+    mapping(bytes32 => bool) public leverageDepositOnlyConsumed;
+
+    // v2.5.0 — Atomic-execute leverage module + timelocked rotation
+    //          (MUST mirror PredmartLendingPool storage layout)
+    address public leverageModule;
+    address public pendingLeverageModule;
+    uint256 public pendingLeverageModuleExecAfter;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -205,6 +214,7 @@ contract PredmartPoolExtension {
     error InvalidIntentSignature();
     error InvalidNonce();
     error ExceedsBorrowBudget();
+    error NotLeverageModule();
 
     /*//////////////////////////////////////////////////////////////
                       ADMIN — INSTANT (safe operations)
@@ -269,6 +279,47 @@ contract PredmartPoolExtension {
     event LiquidatorUpdated(address indexed oldLiquidator, address indexed newLiquidator);
     event LiquidatorChangeProposed(address indexed proposed, uint256 execAfter);
     event LiquidatorChangeCancelled();
+    event LeverageModuleUpdated(address indexed newModule);
+    event LeverageModuleChangeProposed(address indexed newModule, uint256 execAfter);
+    event LeverageModuleChangeCancelled();
+
+    /// @notice Set the leverage module address. Instant only when no module is set yet
+    ///         OR the timelock is disabled. Otherwise use `proposeLeverageModule` +
+    ///         `executeLeverageModule`.
+    /// @dev    During UUPS upgrades, `initializeV17` sets it atomically via the
+    ///         reinitializer, bypassing this timelock as part of a governance-approved
+    ///         upgrade.
+    function setLeverageModule(address mod) external onlyAdmin {
+        if (mod == address(0)) revert InvalidAddress();
+        if (timelockDelay > 0 && leverageModule != address(0)) revert TimelockNotReady();
+        leverageModule = mod;
+        emit LeverageModuleUpdated(mod);
+    }
+
+    /// @notice Propose a timelocked leverage-module rotation.
+    function proposeLeverageModule(address mod) external onlyAdmin {
+        if (mod == address(0)) revert InvalidAddress();
+        pendingLeverageModule = mod;
+        pendingLeverageModuleExecAfter = block.timestamp + timelockDelay;
+        emit LeverageModuleChangeProposed(mod, pendingLeverageModuleExecAfter);
+    }
+
+    /// @notice Execute a previously proposed leverage-module rotation after timelock elapses.
+    function executeLeverageModule() external onlyAdmin {
+        if (pendingLeverageModule == address(0)) revert NoPendingChange();
+        if (block.timestamp < pendingLeverageModuleExecAfter) revert TimelockNotReady();
+        leverageModule = pendingLeverageModule;
+        delete pendingLeverageModule;
+        delete pendingLeverageModuleExecAfter;
+        emit LeverageModuleUpdated(leverageModule);
+    }
+
+    /// @notice Cancel a pending leverage-module rotation.
+    function cancelPendingLeverageModule() external onlyAdmin {
+        delete pendingLeverageModule;
+        delete pendingLeverageModuleExecAfter;
+        emit LeverageModuleChangeCancelled();
+    }
 
     /// @notice Set the dedicated liquidator wallet address.
     ///         Instant only if no liquidator is set yet (first-time setup).
@@ -960,36 +1011,26 @@ contract PredmartPoolExtension {
     event UsdcPulledForLeverage(address indexed borrower, address indexed from, uint256 amount, uint256 indexed tokenId);
     event PoolAdvancedForLeverage(address indexed borrower, uint256 advanceAmount, uint256 indexed tokenId);
 
-    /// @notice Pull USDC from user's Safe + optionally advance borrow USDC from pool to relayer.
-    /// @dev Lives in the extension (via delegatecall) to keep the main contract under EIP-170 size limit.
-    ///      Uses the same LeverageAuth + maxBorrow budget as leverageDeposit.
-    ///      The advance is unsecured pool USDC sent to the relayer before collateral is deposited.
-    ///      It is formalized as a real borrow when leverageDeposit is called (advance offset pattern).
-    ///      TRUST MODEL: Same as leverageDeposit — relayer is trusted to buy shares
-    ///      and deposit them via leverageDeposit. Relayer rotation is timelocked (6h).
-    ///
-    ///      When `allowedFrom != borrower` and `userAmount > 0`, `fromSignature` must be a valid
-    ///      EIP-712 signature from `allowedFrom` over the same LeverageAuth hash. Validated via
-    ///      `SignatureChecker.isValidSignatureNow` (supports both ECDSA and EIP-1271), ensuring that
-    ///      a Gnosis Safe's threshold of owners explicitly consents to the USDC pull.
-    /// @param auth The user's leverage authorization
-    /// @param authSignature Borrower's EIP-712 signature over LeverageAuth
-    /// @param fromSignature `allowedFrom`'s EIP-712 signature over the same LeverageAuth hash.
-    ///                     Only required when `allowedFrom != borrower` AND `userAmount > 0`.
-    ///                     Pass empty bytes otherwise.
-    /// @param userAmount USDC to pull from `allowedFrom` to relayer
-    /// @param advanceAmount USDC to advance from pool to relayer (formalized as borrow in leverageDeposit)
+    /// @notice Module-only entry: pool-side accounting + USDC advance for a leverage
+    ///         open. The PredmartLeverageModule has already verified the borrower's
+    ///         signature, confirmed Safe ownership, and pulled `userAmount` USDC from
+    ///         the Safe to the relayer via execTransactionFromModule before calling.
+    /// @dev    Trust model: msg.sender is the registered `leverageModule`. Module is
+    ///         enabled on the user's Safe and is responsible for credential checks.
+    ///         The pool re-derives `authHash` from `auth` so a malicious module cannot
+    ///         redirect accounting to a forged hash.
+    /// @param  auth           User's leverage authorization (sig already verified by module).
+    /// @param  userAmount     USDC the module transferred Safe → relayer (counted against maxBorrow).
+    /// @param  advanceAmount  USDC the pool advances to relayer (formalized as borrow in leverageDeposit).
     function pullUsdcForLeverage(
         LeverageAuth calldata auth,
-        bytes calldata authSignature,
-        bytes calldata fromSignature,
         uint256 userAmount,
         uint256 advanceAmount
     ) external {
-        if (msg.sender != relayer) revert NotRelayer();
+        if (msg.sender != leverageModule) revert NotLeverageModule();
         if (paused) revert ProtocolPaused();
         if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
-        if (frozenTokens[auth.tokenId]) revert TokenFrozen();  // consistent with leverageDeposit's later check
+        if (frozenTokens[auth.tokenId]) revert TokenFrozen();
         if (block.timestamp > auth.deadline) revert IntentExpired();
         if (userAmount == 0 && advanceAmount == 0) revert BorrowTooSmall();
 
@@ -998,19 +1039,8 @@ contract PredmartPoolExtension {
             auth.maxBorrow, auth.nonce, auth.deadline
         ));
         bytes32 authHash = _hashTypedDataV4Ext(structHash);
-        // SignatureChecker supports contract-account borrowers (Safes) signing LeverageAuth via EIP-1271.
-        if (!SignatureChecker.isValidSignatureNow(auth.borrower, authHash, authSignature)) revert InvalidIntentSignature();
 
-        // Require `allowedFrom`'s explicit consent when pulling its USDC.
-        // A borrower-only signature is insufficient — without this check, a user could sign a
-        // LeverageAuth with their own key but set `allowedFrom` to any USDC-approved third party.
-        if (userAmount > 0 && auth.allowedFrom != auth.borrower) {
-            if (!SignatureChecker.isValidSignatureNow(auth.allowedFrom, authHash, fromSignature)) {
-                revert InvalidIntentSignature();
-            }
-        }
-
-        // Consume nonce on first use (same pattern as leverageDeposit)
+        // Consume nonce on first use.
         bool isFirstUse = (leverageBorrowUsed[authHash] == 0);
         if (isFirstUse) {
             if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
@@ -1018,39 +1048,28 @@ contract PredmartPoolExtension {
         }
 
         // SECURITY: track BOTH user pull AND pool advance against maxBorrow.
-        // userAmount is NOT a field in LEVERAGE_AUTH_TYPEHASH — the relayer chooses
-        // it at TX time. The only on-chain cap on Safe-USDC extraction under this
-        // auth is `maxBorrow`. Counting userAmount here makes maxBorrow act as
-        // "max total operation size", which bounds Safe-USDC extraction even when
-        // the Safe has standing max USDC approval to the pool. DO NOT change to
-        // count only advanceAmount — that would let a compromised relayer drain
-        // the user's Safe up to the approval ceiling.
+        // userAmount is NOT in the typehash, so maxBorrow must bound total
+        // Safe-USDC extraction even with standing module privilege.
         uint256 newTotal = leverageBorrowUsed[authHash] + userAmount + advanceAmount;
         if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
         leverageBorrowUsed[authHash] = newTotal;
 
-        // Pull USDC from user's Safe to relayer
+        // Track user equity for profit-fee calculation. NO transferFrom here — the
+        // module already pulled `userAmount` from the Safe to the relayer in the
+        // same tx via execTransactionFromModule.
         if (userAmount > 0) {
-            // Track user's equity for profit fee calculation (before external call — CEI)
             positions[auth.borrower][auth.tokenId].initialEquity += userAmount;
-            IERC20(_asset()).safeTransferFrom(auth.allowedFrom, msg.sender, userAmount);
             emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, userAmount, auth.tokenId);
         }
 
-        // Advance pool USDC to relayer (formalized as borrow in leverageDeposit)
+        // Pool advance: liquidity check + fee + transfer to relayer.
         if (advanceAmount > 0) {
-            // Track `advanceAmount` (gross) in pendingAdvances/totalPendingAdvances so the
-            // borrower's debt in leverageDeposit includes the operation fee (fee added to debt,
-            // not taken from lender reserves).
             uint256 fee = operationFee;
             if (advanceAmount <= fee) revert AdvanceTooSmall();
             uint256 netAdvance = advanceAmount - fee;
             operationFeePool += fee;
             emit OperationFeeCollected(auth.borrower, fee);
 
-            // Liquidity check (inline — extension can't call _availableCash).
-            // Do NOT subtract `totalPendingAdvances` — those USDC have already left the
-            // pool's balance, so subtracting again would double-count.
             uint256 cash = IERC20(_asset()).balanceOf(address(this));
             if (cash > totalReserves) cash -= totalReserves; else cash = 0;
             if (cash > unsettledRedemptions) cash -= unsettledRedemptions; else cash = 0;
@@ -1058,10 +1077,10 @@ contract PredmartPoolExtension {
             if (cash > protocolFeePool) cash -= protocolFeePool; else cash = 0;
             if (netAdvance > cash) revert InsufficientLiquidity();
 
-            pendingAdvances[authHash] += advanceAmount;   // gross
-            totalPendingAdvances += advanceAmount;        // gross
+            pendingAdvances[authHash] += advanceAmount;
+            totalPendingAdvances += advanceAmount;
             pendingAdvanceTimestamps[authHash] = block.timestamp;
-            IERC20(_asset()).safeTransfer(msg.sender, netAdvance);
+            IERC20(_asset()).safeTransfer(relayer, netAdvance);
             emit PoolAdvancedForLeverage(auth.borrower, netAdvance, auth.tokenId);
         }
     }

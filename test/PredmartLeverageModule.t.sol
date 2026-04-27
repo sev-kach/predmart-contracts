@@ -4,103 +4,89 @@ pragma solidity ^0.8.27;
 
 import {Test} from "forge-std/Test.sol";
 import {PredmartLeverageModule, ISafe} from "../src/PredmartLeverageModule.sol";
+import {MockUSDC} from "./mocks/MockUSDC.sol";
 
-/// @notice Mock Safe — minimal surface so we can drive execTransactionFromModule and
-///         observe the SignMessageLib delegatecall.
+/// @notice Mock Safe that holds USDC balance and forwards execTransactionFromModule
+///         calls (operation=CALL) by performing the encoded call as itself.
+///         For test simplicity only handles transfer() — that's all executeLeverage does.
 contract MockSafe {
     mapping(address => bool) public owners;
-    bytes32 public lastDelegateTo;
-    bytes public lastDelegateData;
     bool public shouldExecSucceed = true;
+    address public usdc;
 
-    // SignMessageLib's signMessage writes to slot 7 (signedMessages mapping).
-    // We mimic the storage layout for the test by exposing the slot directly.
-    mapping(bytes32 => uint256) public signedMessages;
+    function addOwner(address o) external { owners[o] = true; }
+    function setShouldExecSucceed(bool ok) external { shouldExecSucceed = ok; }
+    function setUSDC(address u) external { usdc = u; }
+    function isOwner(address o) external view returns (bool) { return owners[o]; }
 
-    address public signMessageLibImpl;
-
-    function addOwner(address o) external {
-        owners[o] = true;
-    }
-
-    function setSignMessageLib(address impl) external {
-        signMessageLibImpl = impl;
-    }
-
-    function setShouldExecSucceed(bool ok) external {
-        shouldExecSucceed = ok;
-    }
-
-    function isOwner(address o) external view returns (bool) {
-        return owners[o];
-    }
-
-    function execTransactionFromModule(address to, uint256, /* value */ bytes calldata data, uint8 operation)
+    function execTransactionFromModule(address to, uint256 /*value*/, bytes calldata data, uint8 operation)
         external
         returns (bool)
     {
         if (!shouldExecSucceed) return false;
-        require(operation == 1, "expected delegatecall");
-        require(to == signMessageLibImpl, "wrong delegate target");
-        lastDelegateTo = bytes32(uint256(uint160(to)));
-        lastDelegateData = data;
-
-        // Decode signMessage(bytes _data) → _data is abi.encode(authHash) → authHash bytes32
-        bytes memory inner;
-        // skip 4-byte selector + 32-byte offset + 32-byte length, then read 32 bytes
-        bytes32 selector;
-        assembly {
-            selector := calldataload(data.offset)
-        }
-        // strip selector and outer abi.encode wrapping
-        bytes calldata payload = data[4:];
-        bytes memory unwrapped = abi.decode(payload, (bytes));
-        bytes32 authHash;
-        assembly {
-            authHash := mload(add(unwrapped, 32))
-        }
-        // Match Safe's wrapping: messageHash = keccak256(\x19\x01 || safeDomainSep || keccak256(SafeMessage typehash + dataHash))
-        // For test purposes, we record under authHash directly — the module already
-        // computed the right shape upstream; what matters is signMessage was invoked.
-        signedMessages[authHash] = 1;
+        require(operation == 0, "expected call");
+        require(to == usdc, "wrong target");
+        // Decode IERC20.transfer(to, amount) and execute it as the Safe.
+        (address recipient, uint256 amount) = abi.decode(data[4:], (address, uint256));
+        MockUSDC(usdc).transfer(recipient, amount);
         return true;
     }
-
-    // Simulate SignMessageLib's signMessage being delegatecalled — but the MockSafe
-    // does the storage write itself in execTransactionFromModule above for test simplicity.
 }
 
-/// @notice Mock SignMessageLib — present so the module's delegate target check has a real
-///         address. Storage writes happen in MockSafe (via the mock's own assembly path).
-contract MockSignMessageLib {
-    function signMessage(bytes calldata) external pure {}
+/// @notice Mock pool that captures the args of pullUsdcForLeverage for assertion.
+///         Mirrors the storage layout the module expects (relayer + leverageModule).
+contract MockPool {
+    PredmartLeverageModule.LeverageAuth public lastAuth;
+    uint256 public lastUserAmount;
+    uint256 public lastAdvanceAmount;
+    uint256 public callCount;
+    bool public shouldRevert;
+
+    function setShouldRevert(bool v) external { shouldRevert = v; }
+
+    function pullUsdcForLeverage(
+        PredmartLeverageModule.LeverageAuth calldata auth,
+        uint256 userAmount,
+        uint256 advanceAmount
+    ) external {
+        if (shouldRevert) revert("pool revert");
+        lastAuth = auth;
+        lastUserAmount = userAmount;
+        lastAdvanceAmount = advanceAmount;
+        callCount += 1;
+    }
 }
 
 contract PredmartLeverageModuleTest is Test {
     PredmartLeverageModule module;
     MockSafe safe;
-    MockSignMessageLib signLib;
+    MockPool pool;
+    MockUSDC usdc;
 
-    address pool = address(0xCAFE);
+    address relayer = address(0xCAFE);
     uint256 borrowerPk = 0xBEEF;
     address borrower;
 
     PredmartLeverageModule.LeverageAuth auth;
 
     function setUp() public {
-        signLib = new MockSignMessageLib();
-        module = new PredmartLeverageModule(pool, address(signLib));
+        usdc = new MockUSDC();
+        pool = new MockPool();
+        module = new PredmartLeverageModule(address(pool), relayer, address(usdc));
         safe = new MockSafe();
-        safe.setSignMessageLib(address(signLib));
+        safe.setUSDC(address(usdc));
 
         borrower = vm.addr(borrowerPk);
         safe.addOwner(borrower);
+
+        // Fund the Safe with USDC so the module's transfer can succeed.
+        usdc.mint(address(safe), 10_000_000); // $10
 
         auth = PredmartLeverageModule.LeverageAuth({
             borrower: borrower,
             allowedFrom: address(safe),
             tokenId: 12345,
-            maxBorrow: 1_000_000,
+            maxBorrow: 5_000_000, // $5
             nonce: 0,
             deadline: type(uint256).max
         });
@@ -125,53 +111,112 @@ contract PredmartLeverageModuleTest is Test {
         return (abi.encodePacked(r, s, v), authHash);
     }
 
-    function test_preapprove_succeeds_with_valid_owner_signature() public {
-        (bytes memory sig, bytes32 authHash) = _signAuth(borrowerPk);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
-        assertEq(safe.signedMessages(authHash), 1, "auth hash should be marked approved");
+    /*//////////////////////////////////////////////////////////////
+                          HAPPY PATH
+    //////////////////////////////////////////////////////////////*/
+
+    function test_executeLeverage_pulls_userAmount_and_calls_pool() public {
+        (bytes memory sig,) = _signAuth(borrowerPk);
+
+        uint256 userAmount = 1_000_000; // $1
+        uint256 advanceAmount = 2_000_000; // $2 — pool will record but doesn't transfer in mock
+
+        uint256 safeBalBefore = usdc.balanceOf(address(safe));
+        uint256 relayerBalBefore = usdc.balanceOf(relayer);
+
+        module.executeLeverage(ISafe(address(safe)), auth, sig, userAmount, advanceAmount);
+
+        // Safe → relayer: userAmount in USDC moved this tx
+        assertEq(usdc.balanceOf(address(safe)), safeBalBefore - userAmount, "safe USDC decreased");
+        assertEq(usdc.balanceOf(relayer), relayerBalBefore + userAmount, "relayer USDC increased");
+
+        // Pool received the right call args
+        assertEq(pool.callCount(), 1, "pool called once");
+        assertEq(pool.lastUserAmount(), userAmount, "pool got userAmount");
+        assertEq(pool.lastAdvanceAmount(), advanceAmount, "pool got advanceAmount");
     }
 
-    function test_preapprove_reverts_when_safe_address_mismatch() public {
+    function test_executeLeverage_zero_userAmount_skips_safe_transfer() public {
+        (bytes memory sig,) = _signAuth(borrowerPk);
+
+        uint256 safeBalBefore = usdc.balanceOf(address(safe));
+        uint256 relayerBalBefore = usdc.balanceOf(relayer);
+
+        // userAmount = 0, advanceAmount > 0 — module shouldn't touch the Safe
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 0, 1_000_000);
+
+        assertEq(usdc.balanceOf(address(safe)), safeBalBefore, "safe USDC unchanged");
+        assertEq(usdc.balanceOf(relayer), relayerBalBefore, "relayer USDC unchanged");
+        assertEq(pool.callCount(), 1, "pool still called");
+        assertEq(pool.lastUserAmount(), 0);
+        assertEq(pool.lastAdvanceAmount(), 1_000_000);
+    }
+
+    function test_executeLeverage_emits_event() public {
+        (bytes memory sig,) = _signAuth(borrowerPk);
+
+        vm.expectEmit(true, true, true, true);
+        emit PredmartLeverageModule.LeverageExecuted(
+            address(safe), borrower, auth.tokenId, 1_000_000, 2_000_000
+        );
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 2_000_000);
+    }
+
+    function test_executeLeverage_is_permissionless() public {
+        (bytes memory sig,) = _signAuth(borrowerPk);
+        vm.prank(address(0xDEADBEEF));
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 2_000_000);
+        assertEq(pool.callCount(), 1);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                          REVERT PATHS
+    //////////////////////////////////////////////////////////////*/
+
+    function test_executeLeverage_reverts_when_safe_address_mismatch() public {
         auth.allowedFrom = address(0xDEAD);
         (bytes memory sig,) = _signAuth(borrowerPk);
         vm.expectRevert(PredmartLeverageModule.WrongSafe.selector);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
     }
 
-    function test_preapprove_reverts_with_invalid_signature() public {
+    function test_executeLeverage_reverts_with_invalid_signature() public {
         (bytes memory sig,) = _signAuth(0xBAD);
         vm.expectRevert(PredmartLeverageModule.InvalidBorrowerSignature.selector);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
     }
 
-    function test_preapprove_reverts_when_borrower_not_owner() public {
-        // borrower signs validly but is not an owner of the Safe
+    function test_executeLeverage_reverts_when_borrower_not_owner() public {
         uint256 nonOwnerPk = 0xC0DE;
         address nonOwner = vm.addr(nonOwnerPk);
         auth.borrower = nonOwner;
         (bytes memory sig,) = _signAuth(nonOwnerPk);
         vm.expectRevert(PredmartLeverageModule.BorrowerNotSafeOwner.selector);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
     }
 
-    function test_preapprove_reverts_when_safe_exec_fails() public {
+    function test_executeLeverage_reverts_when_safe_exec_fails() public {
         safe.setShouldExecSucceed(false);
         (bytes memory sig,) = _signAuth(borrowerPk);
-        vm.expectRevert(PredmartLeverageModule.SignMessageFailed.selector);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+        vm.expectRevert(PredmartLeverageModule.SafeUsdcPullFailed.selector);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
     }
 
-    function test_preapprove_is_permissionless() public {
-        // anyone may submit the relayer-signed auth — caller identity is not checked
+    function test_executeLeverage_propagates_pool_revert() public {
+        pool.setShouldRevert(true);
         (bytes memory sig,) = _signAuth(borrowerPk);
-        vm.prank(address(0x1234));
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+        vm.expectRevert(); // bubbles up "pool revert"
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 2_000_000);
     }
 
-    function test_preapprove_emits_event() public {
-        (bytes memory sig, bytes32 authHash) = _signAuth(borrowerPk);
-        vm.expectEmit(true, true, true, true);
-        emit PredmartLeverageModule.AuthPreapproved(address(safe), authHash, borrower);
-        module.preapproveAuth(ISafe(address(safe)), auth, sig);
+    /*//////////////////////////////////////////////////////////////
+                         IMMUTABLES & VERSION
+    //////////////////////////////////////////////////////////////*/
+
+    function test_immutables_set_correctly() public {
+        assertEq(module.LENDING_POOL(), address(pool));
+        assertEq(module.RELAYER(), relayer);
+        assertEq(module.USDC(), address(usdc));
+        assertEq(module.VERSION(), "1.0.0");
     }
 }

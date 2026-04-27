@@ -219,32 +219,75 @@ contract Deploy is Script {
                        DEPLOY LEVERAGE MODULE (Standalone)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploy PredmartLeverageModule — a Safe Module that pre-approves
-    ///         LeverageAuth hashes so pullUsdcForLeverage can call with empty fromSignature.
+    /// @notice Deploy PredmartLeverageModule — Safe module that verifies the borrower
+    ///         sig, pulls Safe USDC to relayer, and triggers pool's pullUsdcForLeverage
+    ///         in a single tx.
     /// @dev forge script script/Deploy.s.sol --sig "deployLeverageModule()" --rpc-url polygon_mainnet --broadcast --verify
     function deployLeverageModule() external {
-        // Polygon SignMessageLib — Safe v1.3.0 canonical (works across Safe v1.x with
-        // signedMessages at slot 7). If Polymarket Safes ever upgrade to a layout that
-        // breaks this, redeploy module with the updated lib address.
-        address signMessageLib = 0xA65387F16B013cf2Af4605Ad8aA5ec25a2cbA3a2;
-
         Config memory cfg = _getConfig();
         uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
+        address relayerAddr = vm.envAddress("RELAYER_ADDRESS");
+
         vm.startBroadcast(deployerPrivateKey);
 
-        PredmartLeverageModule module = new PredmartLeverageModule(cfg.lendingPoolProxy, signMessageLib);
+        PredmartLeverageModule module = new PredmartLeverageModule(
+            cfg.lendingPoolProxy,
+            relayerAddr,
+            cfg.usdc
+        );
 
         console.log("=== LEVERAGE MODULE DEPLOYED ===");
         console.log("Module:", address(module));
+        console.log("Version:", module.VERSION());
         console.log("Lending Pool:", module.LENDING_POOL());
-        console.log("SignMessageLib:", module.SIGN_MESSAGE_LIB());
+        console.log("Relayer:", module.RELAYER());
+        console.log("USDC:", module.USDC());
         console.logBytes32(module.POOL_DOMAIN_SEPARATOR());
 
         vm.stopBroadcast();
 
         console.log("");
         console.log("Next: set LEVERAGE_MODULE_ADDRESS in backend .env");
-        console.log("Then: bundle Safe.enableModule(module) into the trading-setup approval tx");
+        console.log("Then: wire into pool via initializeV17 (during pool upgrade) or setLeverageModule (fresh deploy)");
+        console.log("Onboarding bundles Safe.enableModule(module) for new users");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                  DEPLOY UPGRADE WITH MODULE (Path B)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deploy new pool implementation + extension + leverage module.
+    ///         The Safe upgrade tx then calls upgradeToAndCall(newImpl, initializeV17(ext, module)).
+    /// @dev forge script script/Deploy.s.sol --sig "deployUpgradeWithModule()" --rpc-url polygon_mainnet --broadcast --verify
+    function deployUpgradeWithModule() external {
+        Config memory cfg = _getConfig();
+        uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
+        address relayerAddr = vm.envAddress("RELAYER_ADDRESS");
+
+        console.log("=== DEPLOY UPGRADE + MODULE (Path B) ===");
+        console.log("Network:", _getNetworkName());
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        PredmartLendingPool newImpl = new PredmartLendingPool();
+        PredmartLeverageModule module = new PredmartLeverageModule(
+            cfg.lendingPoolProxy,
+            relayerAddr,
+            cfg.usdc
+        );
+
+        vm.stopBroadcast();
+
+        console.log("New extension:    ", address(newExt));
+        console.log("New implementation:", address(newImpl));
+        console.log("New module:       ", address(module));
+        console.log("Module VERSION:   ", module.VERSION());
+        console.log("");
+        console.log("=== NEXT STEPS (via Gnosis Safe UI) ===");
+        console.log("1. proposeAddress(2, <new impl>) on extension -- starts 6h timelock");
+        console.log("2. After 6h: upgradeToAndCall(<new impl>, initializeV17(<new ext>, <module>))");
+        console.log("3. Verify: leverageModule() returns module address; module.VERSION() returns 2.0.0");
     }
 
     /*//////////////////////////////////////////////////////////////

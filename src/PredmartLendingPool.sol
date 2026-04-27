@@ -104,6 +104,8 @@ contract PredmartLendingPool is
     event ReservesWithdrawn(address indexed to, uint256 amount);
     event ExtensionUpdated(address indexed newExtension);
     event ExtensionChangeProposed(address indexed newExtension, uint256 execAfter);
+    event LeverageModuleUpdated(address indexed newModule);
+    // LeverageModuleChangeProposed / LeverageModuleChangeCancelled declared in extension.
 
     /*//////////////////////////////////////////////////////////////
                               STRUCTS
@@ -277,6 +279,15 @@ contract PredmartLendingPool is
     // approval as long as the auth deadline has not expired.
     mapping(bytes32 => bool) public leverageDepositOnlyConsumed;
 
+    // Leverage module + timelocked rotation. Set via initializeV17; rotated via
+    // proposeLeverageModule + executeLeverageModule. The module is the sole authorized
+    // caller of PredmartPoolExtension.pullUsdcForLeverage.
+    // Declared `internal` here to avoid duplicating auto-getters that already exist on
+    // the extension (saves ~300 bytes of pool bytecode); read externally via extension.
+    address internal _leverageModule;
+    address internal _pendingLeverageModule;
+    uint256 internal _pendingLeverageModuleExecAfter;
+
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
     //////////////////////////////////////////////////////////////*/
@@ -348,6 +359,22 @@ contract PredmartLendingPool is
         if (_extension == address(0)) revert InvalidAddress();
         extension = _extension;
         emit ExtensionUpdated(_extension);
+    }
+
+    /// @notice Atomic extension + leverage-module wiring during a UUPS upgrade.
+    /// @dev    Wires the PredmartLeverageModule into pool storage as the sole caller of
+    ///         pullUsdcForLeverage. Bypasses both setExtension and setLeverageModule
+    ///         timelocks because the reinitializer is itself reachable only via
+    ///         upgradeToAndCall, which is gated by the proposeAddress(2) timelock.
+    /// @param  _extension          Extension implementation to wire (reuse current if unchanged).
+    /// @param  _leverageModuleAddr Module address.
+    function initializeV17(address _extension, address _leverageModuleAddr) public reinitializer(17) {
+        if (_extension == address(0)) revert InvalidAddress();
+        if (_leverageModuleAddr == address(0)) revert InvalidAddress();
+        extension = _extension;
+        _leverageModule = _leverageModuleAddr;
+        emit ExtensionUpdated(_extension);
+        emit LeverageModuleUpdated(_leverageModuleAddr);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1026,6 +1053,10 @@ contract PredmartLendingPool is
         delete pendingExtensionExecAfter;
         emit ExtensionUpdated(extension);
     }
+
+    // setLeverageModule / proposeLeverageModule / executeLeverageModule /
+    // cancelPendingLeverageModule moved to PredmartPoolExtension (EIP-170 size limit).
+    // initializeV17 stays here — reinitializers must live in the upgrade target.
 
     // withdrawReserves moved to PredmartPoolExtension (EIP-170 size limit)
 
