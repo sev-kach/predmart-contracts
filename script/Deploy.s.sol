@@ -14,6 +14,7 @@ import { Script, console } from "forge-std/Script.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
+import { PredmartLeverageModule } from "../src/PredmartLeverageModule.sol";
 
 /// @title Deploy
 /// @notice Unified deployment script for Predmart contracts
@@ -212,6 +213,38 @@ contract Deploy is Script {
         vm.stopBroadcast();
 
         console.log("=== UPGRADE TO V0.8.0 COMPLETE ===");
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                       DEPLOY LEVERAGE MODULE (Standalone)
+    //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deploy PredmartLeverageModule — a Safe Module that pre-approves
+    ///         LeverageAuth hashes so pullUsdcForLeverage can call with empty fromSignature.
+    /// @dev forge script script/Deploy.s.sol --sig "deployLeverageModule()" --rpc-url polygon_mainnet --broadcast --verify
+    function deployLeverageModule() external {
+        // Polygon SignMessageLib — Safe v1.3.0 canonical (works across Safe v1.x with
+        // signedMessages at slot 7). If Polymarket Safes ever upgrade to a layout that
+        // breaks this, redeploy module with the updated lib address.
+        address signMessageLib = 0xA65387F16B013cf2Af4605Ad8aA5ec25a2cbA3a2;
+
+        Config memory cfg = _getConfig();
+        uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
+        vm.startBroadcast(deployerPrivateKey);
+
+        PredmartLeverageModule module = new PredmartLeverageModule(cfg.lendingPoolProxy, signMessageLib);
+
+        console.log("=== LEVERAGE MODULE DEPLOYED ===");
+        console.log("Module:", address(module));
+        console.log("Lending Pool:", module.LENDING_POOL());
+        console.log("SignMessageLib:", module.SIGN_MESSAGE_LIB());
+        console.logBytes32(module.POOL_DOMAIN_SEPARATOR());
+
+        vm.stopBroadcast();
+
+        console.log("");
+        console.log("Next: set LEVERAGE_MODULE_ADDRESS in backend .env");
+        console.log("Then: bundle Safe.enableModule(module) into the trading-setup approval tx");
     }
 
     /*//////////////////////////////////////////////////////////////
