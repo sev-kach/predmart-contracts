@@ -1010,6 +1010,7 @@ contract PredmartPoolExtension {
 
     event UsdcPulledForLeverage(address indexed borrower, address indexed from, uint256 amount, uint256 indexed tokenId);
     event PoolAdvancedForLeverage(address indexed borrower, uint256 advanceAmount, uint256 indexed tokenId);
+    event StaleInitialEquityCleared(address indexed borrower, uint256 indexed tokenId, uint256 amount);
 
     /// @notice Module-only entry: pool-side accounting + USDC advance for a leverage
     ///         open. The PredmartLeverageModule has already verified the borrower's
@@ -1058,7 +1059,16 @@ contract PredmartPoolExtension {
         // module already pulled `userAmount` from the Safe to the relayer in the
         // same tx via execTransactionFromModule.
         if (userAmount > 0) {
-            positions[auth.borrower][auth.tokenId].initialEquity += userAmount;
+            Position storage pos = positions[auth.borrower][auth.tokenId];
+            // If the position is verifiably empty (no collateral, no debt) but carries
+            // a non-zero initialEquity, it is stale residue from a prior failed leverage
+            // (pull succeeded, deposit reverted) or a price-skewed full withdrawal.
+            // Reset before the new stamp so the fresh leverage starts from clean basis.
+            if (pos.collateralAmount == 0 && pos.borrowShares == 0 && pos.initialEquity > 0) {
+                emit StaleInitialEquityCleared(auth.borrower, auth.tokenId, pos.initialEquity);
+                pos.initialEquity = 0;
+            }
+            pos.initialEquity += userAmount;
             emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, userAmount, auth.tokenId);
         }
 

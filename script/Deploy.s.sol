@@ -226,7 +226,7 @@ contract Deploy is Script {
     function deployLeverageModule() external {
         Config memory cfg = _getConfig();
         uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
-        address relayerAddr = vm.envAddress("RELAYER_ADDRESS");
+        address relayerAddr = vm.addr(deployerPrivateKey);
 
         vm.startBroadcast(deployerPrivateKey);
 
@@ -262,7 +262,7 @@ contract Deploy is Script {
     function deployUpgradeWithModule() external {
         Config memory cfg = _getConfig();
         uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
-        address relayerAddr = vm.envAddress("RELAYER_ADDRESS");
+        address relayerAddr = vm.addr(deployerPrivateKey);
 
         console.log("=== DEPLOY UPGRADE + MODULE (Path B) ===");
         console.log("Network:", _getNetworkName());
