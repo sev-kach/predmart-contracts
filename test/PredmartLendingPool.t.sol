@@ -3794,9 +3794,9 @@ contract PredmartLendingPoolTest is Test {
             deadline
         );
 
-        // Price = 0.80 USDC/share → fee = $0.03 / 0.80 = 0.0375 shares = 37_500 (scaled)
-        uint256 expectedFee = (uint256(30_000) * 1e18) / 0.80e18;
-        if (expectedFee * 0.80e18 < 30_000 * 1e18) expectedFee += 1; // ceiling rounding
+        // Price = 0.80 USDC/share → fee = $0.01 / 0.80 = 0.0125 shares = 12_500 (scaled)
+        uint256 expectedFee = (uint256(10_000) * 1e18) / 0.80e18;
+        if (expectedFee * 0.80e18 < 10_000 * 1e18) expectedFee += 1; // ceiling rounding
         uint256 expectedCredited = 1_000e6 - expectedFee;
 
         // Event must emit the net credited amount (not the full pre-fee amount)
@@ -3877,7 +3877,7 @@ contract PredmartLendingPoolTest is Test {
 
         uint256 nonce = poolBorrow.depositCollateralFromNonces(borrower);
         uint256 deadline = block.timestamp + 300;
-        // Tiny deposit: 1000 raw shares (= $0.0008 worth at $0.80 price) — less than $0.03 fee
+        // Tiny deposit: 1000 raw shares (= $0.0008 worth at $0.80 price) — less than $0.01 fee
         bytes memory sig = _signDepositCollateralFromAuth(
             borrowerPrivateKey,
             borrower,
@@ -4586,10 +4586,10 @@ contract PredmartLendingPoolTest is Test {
                      OPERATION FEE TESTS (v1.3.0)
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Helper: enable the $0.03 operation fee via admin
+    /// @dev Helper: enable the $0.01 operation fee via admin
     function _enableFee() internal {
         vm.prank(admin);
-        poolAdmin.setOperationFee(30_000); // $0.03 USDC
+        poolAdmin.setOperationFee(10_000); // $0.01 USDC
     }
 
     function test_borrowViaRelay_deductsFee() public {
@@ -4634,19 +4634,19 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolBorrow.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
 
-        // User receives $400 - $0.03 = $399.97
+        // User receives $400 - $0.01 = $399.99
         uint256 received = usdc.balanceOf(borrower) - borrowerBalBefore;
         assertEq(
             received,
-            borrowAmt - 30_000,
+            borrowAmt - 10_000,
             "Borrower should receive amount minus fee"
         );
 
         // Fee went to operationFeePool
         assertEq(
             pool.operationFeePool(),
-            30_000,
-            "operationFeePool should be $0.03"
+            10_000,
+            "operationFeePool should be $0.01"
         );
     }
 
@@ -4726,8 +4726,8 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolBorrow.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.80e18));
 
-        // Fee in shares: $0.03 / $0.80 = 0.0375 shares = 37500 raw (rounded up)
-        uint256 expectedFeeShares = 37_500; // 30000 * 1e18 / 0.80e18 = 37500
+        // Fee in shares: $0.01 / $0.80 = 0.0125 shares = 12500 raw (rounded up)
+        uint256 expectedFeeShares = 12_500; // 10000 * 1e18 / 0.80e18 = 12500
         uint256 received = ctf.balanceOf(borrower, TOKEN_ID_YES) -
             borrowerSharesBefore;
         assertEq(
@@ -4783,8 +4783,8 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolBorrow.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.50e18));
 
-        // Fee in shares: $0.03 / $0.50 = 0.06 shares = 60000 raw
-        uint256 expectedFeeShares = 60_000;
+        // Fee in shares: $0.01 / $0.50 = 0.02 shares = 20000 raw
+        uint256 expectedFeeShares = 20_000;
         uint256 received = ctf.balanceOf(borrower, TOKEN_ID_YES) -
             borrowerSharesBefore;
         assertEq(
@@ -4812,7 +4812,7 @@ contract PredmartLendingPoolTest is Test {
         );
         vm.stopPrank();
 
-        // Withdraw 1 share at $0.01 → fee = 3 shares > 1 share → entire withdrawal taken as fee
+        // Withdraw 1 share at $0.005 → fee = 2 shares > 1 share → entire withdrawal taken as fee
         uint256 withdrawAmt = 1e6;
         uint256 nonce = pool.withdrawNonces(borrower);
         uint256 deadline = block.timestamp + 300;
@@ -4838,7 +4838,7 @@ contract PredmartLendingPoolTest is Test {
         uint256 borrowerSharesBefore = ctf.balanceOf(borrower, TOKEN_ID_YES);
 
         vm.prank(relayer);
-        poolBorrow.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.01e18));
+        poolBorrow.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID_YES, 0.005e18));
 
         // User receives 0 shares — entire withdrawal consumed by fee (spam protection)
         uint256 received = ctf.balanceOf(borrower, TOKEN_ID_YES) -
@@ -4899,7 +4899,7 @@ contract PredmartLendingPoolTest is Test {
         );
         assertEq(
             pool.operationFeePool(),
-            30_000,
+            10_000,
             "Fee charged on first borrow"
         );
 
@@ -4914,7 +4914,7 @@ contract PredmartLendingPoolTest is Test {
         );
         assertEq(
             pool.operationFeePool(),
-            30_000,
+            10_000,
             "No additional fee on second borrow"
         );
     }
@@ -4967,7 +4967,7 @@ contract PredmartLendingPoolTest is Test {
         _enableFee();
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
-        uint256 feePoolBefore = pool.operationFeePool(); // 30000 from borrow
+        uint256 feePoolBefore = pool.operationFeePool(); // 10000 from borrow
 
         (
             PredmartPoolExtension.CloseAuth memory auth,
@@ -4977,9 +4977,9 @@ contract PredmartLendingPoolTest is Test {
         vm.prank(relayer);
         poolAdmin.initiateClose(auth, sig, priceData);
 
-        // Settle with proceeds less than fee ($0.02 < $0.03)
+        // Settle with proceeds less than fee ($0.005 < $0.01)
         vm.prank(relayer);
-        poolAdmin.settleClose(borrower, TOKEN_ID_YES, 20_000, 0);
+        poolAdmin.settleClose(borrower, TOKEN_ID_YES, 5_000, 0);
 
         // Fee not deducted from settleClose (proceeds too low)
         assertEq(
@@ -5027,16 +5027,16 @@ contract PredmartLendingPoolTest is Test {
 
         // Generate some fees via borrow
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
-        assertEq(pool.operationFeePool(), 30_000, "Fee collected");
+        assertEq(pool.operationFeePool(), 10_000, "Fee collected");
 
         uint256 adminBalBefore = usdc.balanceOf(admin);
         vm.prank(admin);
-        poolAdmin.withdrawOperationFees(30_000);
+        poolAdmin.withdrawOperationFees(10_000);
 
         assertEq(pool.operationFeePool(), 0, "Pool drained");
         assertEq(
             usdc.balanceOf(admin) - adminBalBefore,
-            30_000,
+            10_000,
             "Admin received fees"
         );
     }
@@ -5100,12 +5100,12 @@ contract PredmartLendingPoolTest is Test {
         // Borrow → generates fee in operationFeePool
         _depositAndBorrow(borrower, TOKEN_ID_YES, 1000e6, 400e6, 0.80e18);
 
-        // totalAssets should NOT include the $0.03 fee (it's reserved for relayer, not lenders)
+        // totalAssets should NOT include the $0.01 fee (it's reserved for relayer, not lenders)
         // totalAssets = cash + borrows - reserves - unsettled - operationFeePool
         uint256 totalAssetsAfter = pool.totalAssets();
 
         // The fee pool should be excluded — totalAssets tracks lender value, not relayer fees
-        assertEq(pool.operationFeePool(), 30_000, "Fee collected");
+        assertEq(pool.operationFeePool(), 10_000, "Fee collected");
         // totalAssets should be same as if no fee existed (the USDC stays in contract either way)
         assertApproxEqAbs(
             totalAssetsAfter,
@@ -5132,7 +5132,7 @@ contract PredmartLendingPoolTest is Test {
         );
         assertEq(
             pool.operationFeePool(),
-            30_000,
+            10_000,
             "Fee went to operationFeePool"
         );
 

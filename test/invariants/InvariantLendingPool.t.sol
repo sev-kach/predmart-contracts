@@ -258,9 +258,9 @@ contract InvariantLendingPoolTest is Test {
         vm.prank(admin);
         pool.setExtension(address(ext));
 
-        // Enable operation fee ($0.03)
+        // Enable operation fee ($0.01)
         vm.prank(admin);
-        poolAdmin.setOperationFee(30_000);
+        poolAdmin.setOperationFee(10_000);
 
         // Seed accounts
         usdc.mint(lender, 1_000_000e6);
