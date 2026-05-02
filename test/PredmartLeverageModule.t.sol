@@ -6,17 +6,45 @@ import {Test} from "forge-std/Test.sol";
 import {PredmartLeverageModule, ISafe} from "../src/PredmartLeverageModule.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 
-/// @notice Mock Safe that holds USDC balance and forwards execTransactionFromModule
-///         calls (operation=CALL) by performing the encoded call as itself.
-///         For test simplicity only handles transfer() — that's all executeLeverage does.
+/// @notice Mock pUSD — same interface as MockUSDC, separate contract so balances don't co-mingle.
+contract MockPUSD is MockUSDC {}
+
+/// @notice Mock CollateralOnramp — wraps USDC.e from caller into pUSD minted to recipient.
+contract MockCollateralOnramp {
+    address public usdcE;
+    address public pusd;
+    bool public shouldFail;
+
+    function setTokens(address _usdcE, address _pusd) external { usdcE = _usdcE; pusd = _pusd; }
+    function setShouldFail(bool v) external { shouldFail = v; }
+
+    function wrap(address _asset, address _to, uint256 _amount) external {
+        require(!shouldFail, "wrap failed");
+        require(_asset == usdcE, "wrong asset");
+        MockUSDC(usdcE).transferFrom(msg.sender, address(this), _amount);
+        MockPUSD(pusd).mint(_to, _amount);
+    }
+}
+
+/// @notice Mock Safe that holds token balances and forwards execTransactionFromModule calls.
+///         Approves the onramp on USDC.e during setup to allow wrap. Executes the encoded
+///         transfer / wrap as itself.
 contract MockSafe {
     mapping(address => bool) public owners;
     bool public shouldExecSucceed = true;
-    address public usdc;
+    address public pusd;
+    address public usdcE;
+    address public onramp;
 
     function addOwner(address o) external { owners[o] = true; }
     function setShouldExecSucceed(bool ok) external { shouldExecSucceed = ok; }
-    function setUSDC(address u) external { usdc = u; }
+    function setTokens(address _pusd, address _usdcE, address _onramp) external {
+        pusd = _pusd;
+        usdcE = _usdcE;
+        onramp = _onramp;
+        // Approve onramp to pull USDC.e during wrap.
+        MockUSDC(_usdcE).approve(_onramp, type(uint256).max);
+    }
     function isOwner(address o) external view returns (bool) { return owners[o]; }
 
     function execTransactionFromModule(address to, uint256 /*value*/, bytes calldata data, uint8 operation)
@@ -25,16 +53,14 @@ contract MockSafe {
     {
         if (!shouldExecSucceed) return false;
         require(operation == 0, "expected call");
-        require(to == usdc, "wrong target");
-        // Decode IERC20.transfer(to, amount) and execute it as the Safe.
-        (address recipient, uint256 amount) = abi.decode(data[4:], (address, uint256));
-        MockUSDC(usdc).transfer(recipient, amount);
-        return true;
+        // Re-execute the call from this contract's context.
+        (bool ok, ) = to.call(data);
+        return ok;
     }
 }
 
-/// @notice Mock pool that captures the args of pullUsdcForLeverage for assertion.
-///         Mirrors the storage layout the module expects (relayer + leverageModule).
+/// @notice Mock pool that captures pullUsdcForLeverage args and mirrors the storage
+///         layout the module expects. Runs as standalone contract — module calls it directly.
 contract MockPool {
     PredmartLeverageModule.LeverageAuth public lastAuth;
     uint256 public lastUserAmount;
@@ -61,7 +87,9 @@ contract PredmartLeverageModuleTest is Test {
     PredmartLeverageModule module;
     MockSafe safe;
     MockPool pool;
-    MockUSDC usdc;
+    MockUSDC usdcE;
+    MockPUSD pusd;
+    MockCollateralOnramp onramp;
 
     address relayer = address(0xCAFE);
     uint256 borrowerPk = 0xBEEF;
@@ -70,21 +98,33 @@ contract PredmartLeverageModuleTest is Test {
     PredmartLeverageModule.LeverageAuth auth;
 
     function setUp() public {
-        usdc = new MockUSDC();
+        usdcE = new MockUSDC();
+        pusd = new MockPUSD();
+        onramp = new MockCollateralOnramp();
+        onramp.setTokens(address(usdcE), address(pusd));
+
         pool = new MockPool();
-        module = new PredmartLeverageModule(address(pool), relayer, address(usdc));
+        module = new PredmartLeverageModule(
+            address(pool),
+            relayer,
+            address(usdcE),
+            address(pusd),
+            address(onramp)
+        );
+
         safe = new MockSafe();
-        safe.setUSDC(address(usdc));
+        safe.setTokens(address(pusd), address(usdcE), address(onramp));
 
         borrower = vm.addr(borrowerPk);
         safe.addOwner(borrower);
 
-        // Fund the Safe with USDC so the module's transfer can succeed.
-        usdc.mint(address(safe), 10_000_000); // $10
+        // Fund the Safe with pUSD by default — happy path needs no wrap.
+        pusd.mint(address(safe), 10_000_000); // $10
 
         auth = PredmartLeverageModule.LeverageAuth({
             borrower: borrower,
             allowedFrom: address(safe),
+            recipient: borrower,
             tokenId: 12345,
             maxBorrow: 5_000_000, // $5
             nonce: 0,
@@ -98,6 +138,7 @@ contract PredmartLeverageModuleTest is Test {
                 module.LEVERAGE_AUTH_TYPEHASH(),
                 auth.borrower,
                 auth.allowedFrom,
+                auth.recipient,
                 auth.tokenId,
                 auth.maxBorrow,
                 auth.nonce,
@@ -115,20 +156,20 @@ contract PredmartLeverageModuleTest is Test {
                           HAPPY PATH
     //////////////////////////////////////////////////////////////*/
 
-    function test_executeLeverage_pulls_userAmount_and_calls_pool() public {
+    function test_executeLeverage_pulls_pusd_and_calls_pool() public {
         (bytes memory sig,) = _signAuth(borrowerPk);
 
         uint256 userAmount = 1_000_000; // $1
-        uint256 advanceAmount = 2_000_000; // $2 — pool will record but doesn't transfer in mock
+        uint256 advanceAmount = 2_000_000; // $2
 
-        uint256 safeBalBefore = usdc.balanceOf(address(safe));
-        uint256 relayerBalBefore = usdc.balanceOf(relayer);
+        uint256 safeBalBefore = pusd.balanceOf(address(safe));
+        uint256 relayerBalBefore = pusd.balanceOf(relayer);
 
         module.executeLeverage(ISafe(address(safe)), auth, sig, userAmount, advanceAmount);
 
-        // Safe → relayer: userAmount in USDC moved this tx
-        assertEq(usdc.balanceOf(address(safe)), safeBalBefore - userAmount, "safe USDC decreased");
-        assertEq(usdc.balanceOf(relayer), relayerBalBefore + userAmount, "relayer USDC increased");
+        // Safe → relayer: userAmount in pUSD moved this tx
+        assertEq(pusd.balanceOf(address(safe)), safeBalBefore - userAmount, "safe pUSD decreased");
+        assertEq(pusd.balanceOf(relayer), relayerBalBefore + userAmount, "relayer pUSD increased");
 
         // Pool received the right call args
         assertEq(pool.callCount(), 1, "pool called once");
@@ -136,17 +177,32 @@ contract PredmartLeverageModuleTest is Test {
         assertEq(pool.lastAdvanceAmount(), advanceAmount, "pool got advanceAmount");
     }
 
+    function test_executeLeverage_wraps_usdce_when_pusd_short() public {
+        // Safe has 0 pUSD, $10 USDC.e — module should wrap-all then pull.
+        deal(address(pusd), address(safe), 0);
+        usdcE.mint(address(safe), 10_000_000);
+
+        (bytes memory sig,) = _signAuth(borrowerPk);
+        uint256 userAmount = 1_000_000;
+
+        module.executeLeverage(ISafe(address(safe)), auth, sig, userAmount, 0);
+
+        // After wrap-all: safe USDC.e zeroed, pUSD = (10 - 1) = 9
+        assertEq(usdcE.balanceOf(address(safe)), 0, "USDC.e wrapped");
+        assertEq(pusd.balanceOf(address(safe)), 10_000_000 - userAmount, "pUSD remaining after pull");
+        assertEq(pusd.balanceOf(relayer), userAmount, "relayer got pUSD");
+    }
+
     function test_executeLeverage_zero_userAmount_skips_safe_transfer() public {
         (bytes memory sig,) = _signAuth(borrowerPk);
 
-        uint256 safeBalBefore = usdc.balanceOf(address(safe));
-        uint256 relayerBalBefore = usdc.balanceOf(relayer);
+        uint256 safeBalBefore = pusd.balanceOf(address(safe));
+        uint256 relayerBalBefore = pusd.balanceOf(relayer);
 
-        // userAmount = 0, advanceAmount > 0 — module shouldn't touch the Safe
         module.executeLeverage(ISafe(address(safe)), auth, sig, 0, 1_000_000);
 
-        assertEq(usdc.balanceOf(address(safe)), safeBalBefore, "safe USDC unchanged");
-        assertEq(usdc.balanceOf(relayer), relayerBalBefore, "relayer USDC unchanged");
+        assertEq(pusd.balanceOf(address(safe)), safeBalBefore, "safe pUSD unchanged");
+        assertEq(pusd.balanceOf(relayer), relayerBalBefore, "relayer pUSD unchanged");
         assertEq(pool.callCount(), 1, "pool still called");
         assertEq(pool.lastUserAmount(), 0);
         assertEq(pool.lastAdvanceAmount(), 1_000_000);
@@ -198,7 +254,22 @@ contract PredmartLeverageModuleTest is Test {
     function test_executeLeverage_reverts_when_safe_exec_fails() public {
         safe.setShouldExecSucceed(false);
         (bytes memory sig,) = _signAuth(borrowerPk);
-        vm.expectRevert(PredmartLeverageModule.SafeUsdcPullFailed.selector);
+        vm.expectRevert(PredmartLeverageModule.SafePullFailed.selector);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
+    }
+
+    function test_executeLeverage_reverts_when_funds_insufficient() public {
+        // No pUSD, no USDC.e — wrap can't cover pull.
+        deal(address(pusd), address(safe), 0);
+        (bytes memory sig,) = _signAuth(borrowerPk);
+        vm.expectRevert(PredmartLeverageModule.InsufficientSafeFunds.selector);
+        module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
+    }
+
+    function test_executeLeverage_reverts_on_zero_recipient() public {
+        auth.recipient = address(0);
+        (bytes memory sig,) = _signAuth(borrowerPk);
+        vm.expectRevert(PredmartLeverageModule.InvalidRecipient.selector);
         module.executeLeverage(ISafe(address(safe)), auth, sig, 1_000_000, 0);
     }
 
@@ -213,10 +284,12 @@ contract PredmartLeverageModuleTest is Test {
                          IMMUTABLES & VERSION
     //////////////////////////////////////////////////////////////*/
 
-    function test_immutables_set_correctly() public {
+    function test_immutables_set_correctly() public view {
         assertEq(module.LENDING_POOL(), address(pool));
         assertEq(module.RELAYER(), relayer);
-        assertEq(module.USDC(), address(usdc));
-        assertEq(module.VERSION(), "1.0.0");
+        assertEq(module.USDC_E(), address(usdcE));
+        assertEq(module.PUSD(), address(pusd));
+        assertEq(module.COLLATERAL_ONRAMP(), address(onramp));
+        assertEq(module.VERSION(), "2.0.0");
     }
 }

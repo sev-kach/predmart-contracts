@@ -10,16 +10,12 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 import { ERC1155Holder } from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
-import { PredmartOracle } from "./PredmartOracle.sol";
 import { PredmartPoolLib } from "./PredmartPoolLib.sol";
-import { ICTF } from "./interfaces/ICTF.sol";
 import {
     Position, MarketResolution, Redemption, PendingClose, PendingLiquidation,
-    NotAdmin, InvalidAddress, NoPosition, TimelockNotReady, NoPendingChange, NotRelayer, NoPendingLiquidation, NotLiquidator, TokenFrozen,
-    BadDebtAbsorbed, InterestAccrued, PositionCloseInitiated, OperationFeeCollected, LiquidationSettled, ProfitFeeCollected, CollateralDeposited
+    NotAdmin, InvalidAddress, TimelockNotReady, NoPendingChange,
+    InterestAccrued
 } from "./PredmartTypes.sol";
 
 /// @title PredmartLendingPool
@@ -48,114 +44,27 @@ contract PredmartLendingPool is
     uint256 public constant MIN_BORROW = 1e6; // $1 USDC minimum debt
     uint256 public constant CLOSE_TIMEOUT = 48 hours; // Max duration for pending flash close settlement
 
-    // EIP-712 typehashes for meta-transaction intents
-    bytes32 public constant BORROW_INTENT_TYPEHASH = keccak256(
-        "BorrowIntent(address borrower,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
-    );
-    bytes32 public constant WITHDRAW_INTENT_TYPEHASH = keccak256(
-        "WithdrawIntent(address borrower,address to,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
-    );
-    bytes32 public constant LEVERAGE_AUTH_TYPEHASH = keccak256(
-        "LeverageAuth(address borrower,address allowedFrom,uint256 tokenId,uint256 maxBorrow,uint256 nonce,uint256 deadline)"
-    );
-    bytes32 public constant CLOSE_AUTH_TYPEHASH = keccak256(
-        "CloseAuth(address borrower,address allowedTo,uint256 tokenId,uint256 nonce,uint256 deadline)"
-    );
-    bytes32 public constant DEPOSIT_COLLATERAL_FROM_TYPEHASH = keccak256(
-        "DepositCollateralFromAuth(address from,address creditTo,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
-    );
-
     /*//////////////////////////////////////////////////////////////
                                 ERRORS
     //////////////////////////////////////////////////////////////*/
 
     error ProtocolPaused();
-    error MarketResolved();
-    error PositionHealthy();
-    error ExceedsLTV();
-    error InsufficientLiquidity();
-    error BorrowTooSmall();
-    error ExceedsTokenCap();
-    error DepthCapExceeded();
-    error IntentExpired();
-    error InvalidIntentSignature();
-    error InvalidNonce();
-    error ExceedsBorrowBudget();
-    error AuthAlreadyUsed();
-    error PositionHasPendingClose();
-    error NoPendingClose();
-    error CloseNotExpired();
-    error PositionUnhealthy();
 
     /*//////////////////////////////////////////////////////////////
                                 EVENTS
     //////////////////////////////////////////////////////////////*/
 
-    event CollateralWithdrawn(address indexed borrower, uint256 indexed tokenId, uint256 amount);
-    event Borrowed(address indexed borrower, uint256 indexed tokenId, uint256 amount);
-    // Repaid event moved to PredmartTypes (now emitted from extension's repay function)
-    event Liquidated(
-        address indexed liquidator,
-        address indexed borrower,
-        uint256 indexed tokenId,
-        uint256 collateralSeized,
-        uint256 debtRepaid
-    );
-    event ReservesWithdrawn(address indexed to, uint256 amount);
     event ExtensionUpdated(address indexed newExtension);
     event ExtensionChangeProposed(address indexed newExtension, uint256 execAfter);
     event LeverageModuleUpdated(address indexed newModule);
-    // LeverageModuleChangeProposed / LeverageModuleChangeCancelled declared in extension.
 
     /*//////////////////////////////////////////////////////////////
                               STRUCTS
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice EIP-712 typed data for borrow intent (signed by borrower off-chain)
-    struct BorrowIntent {
-        address borrower;
-        uint256 tokenId;
-        uint256 amount; // USDC (6 decimals)
-        uint256 nonce;
-        uint256 deadline;
-    }
-
-    /// @notice EIP-712 typed data for withdraw intent (signed by borrower off-chain)
-    struct WithdrawIntent {
-        address borrower;
-        address to; // Destination for collateral (e.g. Polymarket Safe proxy)
-        uint256 tokenId;
-        uint256 amount; // Shares to withdraw
-        uint256 nonce;
-        uint256 deadline;
-    }
-
-    /// @notice EIP-712 authorization for a leverage operation (signed once, reusable within budget)
-    struct LeverageAuth {
-        address borrower;
-        address allowedFrom; // Permitted source for CTF shares (user's Safe or relayer, always allowed via msg.sender)
-        uint256 tokenId;
-        uint256 maxBorrow; // Max cumulative USDC the relayer can borrow under this auth (6 decimals)
-        uint256 nonce;
-        uint256 deadline;
-    }
-
-    /// @notice EIP-712 authorization for pool-funded flash close (signed once, closes entire position)
-    struct CloseAuth {
-        address borrower;
-        address allowedTo; // Surplus USDC destination after settlement (user's Safe)
-        uint256 tokenId;
-        uint256 nonce;
-        uint256 deadline;
-    }
-
-    /// @notice Non-signature parameters bundled into a struct to avoid stack-too-deep in leverageDeposit.
-    struct LeverageDepositData {
-        address from;         // Address holding CTF shares (user's Safe or relayer)
-        address borrowTo;     // Destination for borrowed USDC (user's Safe or relayer)
-        uint256 depositAmount;
-        uint256 borrowAmount;
-    }
+    // Structs moved to PredmartBorrowExtension (borrow/leverage entries) and PredmartPoolExtension (close/lifecycle):
+    //   BorrowIntent, WithdrawIntent, LeverageAuth, LeverageDepositData → PredmartBorrowExtension
+    //   CloseAuth → PredmartPoolExtension
 
     /*//////////////////////////////////////////////////////////////
                             STATE — SLOT 0+
@@ -237,7 +146,7 @@ contract PredmartLendingPool is
     mapping(address => mapping(uint256 => PendingClose)) public pendingCloses; // borrower => tokenId => pending
 
     // v1.3.0 — Flat fee for relayed operations (spam protection / relayer gas sustainability)
-    uint256 public operationFee; // USDC (6 decimals). E.g. 30000 = $0.03
+    uint256 public operationFee; // USDC (6 decimals). E.g. 10000 = $0.01
     uint256 public operationFeePool; // Accumulated USDC fees dedicated to relayer gas top-up
     mapping(uint256 => uint256) public feeSharesAccumulated; // tokenId => CTF shares collected as withdrawal fees
 
@@ -279,14 +188,19 @@ contract PredmartLendingPool is
     // approval as long as the auth deadline has not expired.
     mapping(bytes32 => bool) public leverageDepositOnlyConsumed;
 
-    // Leverage module + timelocked rotation. Set via initializeV17; rotated via
-    // proposeLeverageModule + executeLeverageModule. The module is the sole authorized
-    // caller of PredmartPoolExtension.pullUsdcForLeverage.
-    // Declared `internal` here to avoid duplicating auto-getters that already exist on
-    // the extension (saves ~300 bytes of pool bytecode); read externally via extension.
-    address internal _leverageModule;
-    address internal _pendingLeverageModule;
-    uint256 internal _pendingLeverageModuleExecAfter;
+    // Leverage module + timelocked rotation. Set during the upgrade reinitializer;
+    // rotated via proposeLeverageModule + executeLeverageModule on the extension.
+    // The module is the sole authorized caller of pullUsdcForLeverage.
+    // Public so callers can read pool state directly without going through the fallback.
+    // Names match PredmartPoolExtension and PredmartBorrowExtension storage so the
+    // delegatecall slot shape is identical.
+    address public leverageModule;
+    address public pendingLeverageModule;
+    uint256 public pendingLeverageModuleExecAfter;
+
+    // Selector → extension routing table populated by initializeV19. Rebound via
+    // setExtensionSelectors (timelock-respecting once a binding exists).
+    mapping(bytes4 => address) public extensionForSelector;
 
     /*//////////////////////////////////////////////////////////////
                               MODIFIERS
@@ -338,42 +252,46 @@ contract PredmartLendingPool is
         relayer = _relayer;
     }
 
-    // initializeV5-V14 removed — already executed on mainnet, reinitializer prevents reuse.
+    // initializeV5-V18 removed — already executed on mainnet, reinitializer prevents reuse.
     // V1-V4 retained because test/deploy scripts use them for fresh-proxy setup.
     // Future upgrades MUST add a fresh `initializeVN` with `reinitializer(N)` for any new state setup.
 
-    /// @notice Atomic extension rotation during UUPS upgrade.
-    /// @dev The reinitializer is callable only once via `upgradeToAndCall`, which is itself
-    ///      gated by the proposeAddress timelock — so this safely bypasses the setExtension
-    ///      timelock for a governance-approved upgrade.
-    function initializeV15(address _extension) public reinitializer(15) {
-        if (_extension == address(0)) revert InvalidAddress();
-        extension = _extension;
-        emit ExtensionUpdated(_extension);
-    }
-
-    /// @notice Atomic extension rotation for v16 upgrade.
-    /// @dev Code-only fix (initialEquity correctly reduced on borrow/withdraw to prevent
-    ///      profit-fee underpayment on mixed leverage+borrow positions). No new storage.
-    function initializeV16(address _extension) public reinitializer(16) {
-        if (_extension == address(0)) revert InvalidAddress();
-        extension = _extension;
-        emit ExtensionUpdated(_extension);
-    }
-
-    /// @notice Atomic extension + leverage-module wiring during a UUPS upgrade.
-    /// @dev    Wires the PredmartLeverageModule into pool storage as the sole caller of
-    ///         pullUsdcForLeverage. Bypasses both setExtension and setLeverageModule
-    ///         timelocks because the reinitializer is itself reachable only via
-    ///         upgradeToAndCall, which is gated by the proposeAddress(2) timelock.
-    /// @param  _extension          Extension implementation to wire (reuse current if unchanged).
-    /// @param  _leverageModuleAddr Module address.
-    function initializeV17(address _extension, address _leverageModuleAddr) public reinitializer(17) {
-        if (_extension == address(0)) revert InvalidAddress();
+    /// @notice V19 — V2-native architecture: split into PoolExtension (lifecycle) +
+    ///         BorrowExtension (borrow/leverage entries). Populates the selector-routing
+    ///         table so the new fallback knows where each function lives. Also rotates
+    ///         the LeverageModule address to the V2-aware build that pulls pUSD.
+    /// @dev    Must be called once during the upgrade tx (via upgradeToAndCall).
+    /// @param  _poolExt          PredmartPoolExtension (lifecycle) address.
+    /// @param  _borrowExt        PredmartBorrowExtension address.
+    /// @param  _leverageModuleAddr V2-native PredmartLeverageModule (pulls pUSD with optional wrap-all).
+    /// @param  _poolSelectors    Selectors that route to PoolExtension.
+    /// @param  _borrowSelectors  Selectors that route to BorrowExtension.
+    function initializeV19(
+        address _poolExt,
+        address _borrowExt,
+        address _leverageModuleAddr,
+        bytes4[] calldata _poolSelectors,
+        bytes4[] calldata _borrowSelectors
+    ) public reinitializer(19) {
+        if (_poolExt == address(0)) revert InvalidAddress();
+        if (_borrowExt == address(0)) revert InvalidAddress();
         if (_leverageModuleAddr == address(0)) revert InvalidAddress();
-        extension = _extension;
-        _leverageModule = _leverageModuleAddr;
-        emit ExtensionUpdated(_extension);
+
+        // Legacy single-extension slot points to the lifecycle extension; the selector
+        // routing mapping handles per-function dispatch. Any selector not registered
+        // (e.g. forgotten in the upgrade payload) falls back to `extension` so an
+        // incomplete migration still resolves to the prior behavior.
+        extension = _poolExt;
+        leverageModule = _leverageModuleAddr;
+
+        for (uint256 i = 0; i < _poolSelectors.length; i++) {
+            extensionForSelector[_poolSelectors[i]] = _poolExt;
+        }
+        for (uint256 i = 0; i < _borrowSelectors.length; i++) {
+            extensionForSelector[_borrowSelectors[i]] = _borrowExt;
+        }
+
+        emit ExtensionUpdated(_poolExt);
         emit LeverageModuleUpdated(_leverageModuleAddr);
     }
 
@@ -540,422 +458,13 @@ contract PredmartLendingPool is
     // depositCollateral() (direct EOA) moved to PredmartPoolExtension (size).
     // Users with Polymarket Safes should use depositCollateralFrom (meta-tx).
 
-    /// @notice Deposit collateral from a third-party address (e.g. Polymarket Safe proxy) authorized by EIP-712 signature.
-    /// @dev The `from` address must have approved this contract via setApprovalForAll.
-    ///      Authorization is verified via `SignatureChecker.isValidSignatureNow(from, digest, signature)`,
-    ///      which supports both ECDSA (EOAs) and EIP-1271 (contract accounts like Gnosis Safe).
-    ///      For a multi-sig Safe, the signature must be produced by the Safe's threshold of owners —
-    ///      a single rogue owner cannot authorize the action.
-    ///
-    ///      SPAM PROTECTION: When submitted via the relayer (`msg.sender == relayer`), `operationFee`
-    ///      worth of shares is deducted from the deposit and accumulated in `feeSharesAccumulated`.
-    ///      Same pattern as `withdrawViaRelay`. For direct submissions (user pays own gas), no fee.
-    /// @param from Address holding the CTF shares (e.g. user's Gnosis Safe)
-    /// @param creditTo Address credited with the collateral position (explicitly authorized in the signature)
-    /// @param tokenId Polymarket CTF token ID
-    /// @param amount Number of shares to deposit
-    /// @param nonce Per-`from` replay nonce (must equal depositCollateralFromNonces[from])
-    /// @param deadline EIP-712 expiration timestamp
-    /// @param signature `from`'s EIP-712 signature over DepositCollateralFromAuth
-    /// @param priceData Signed oracle price — used for fee calculation and initialEquity tracking
-    function depositCollateralFrom(
-        address from,
-        address creditTo,
-        uint256 tokenId,
-        uint256 amount,
-        uint256 nonce,
-        uint256 deadline,
-        bytes calldata signature,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant whenNotPaused {
-        if (block.timestamp > deadline) revert IntentExpired();
-        if (nonce != depositCollateralFromNonces[from]) revert InvalidNonce();
-
-        bytes32 structHash = keccak256(abi.encode(
-            DEPOSIT_COLLATERAL_FROM_TYPEHASH,
-            from, creditTo, tokenId, amount, nonce, deadline
-        ));
-        bytes32 digest = _hashTypedDataV4(structHash);
-
-        if (!SignatureChecker.isValidSignatureNow(from, digest, signature)) {
-            revert InvalidIntentSignature();
-        }
-
-        depositCollateralFromNonces[from]++;
-
-        // Verify oracle price (needed for both fee calc and equity tracking)
-        if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
-        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-
-        // Spam protection: compute operationFee in shares for relayed calls.
-        // If fee >= amount, entire deposit taken as fee (no position credit).
-        uint256 feeInShares;
-        if (operationFee > 0 && msg.sender == relayer) {
-            feeInShares = operationFee.mulDiv(1e18, price, Math.Rounding.Ceil);
-            if (feeInShares > amount) feeInShares = amount;
-            feeSharesAccumulated[tokenId] += feeInShares;
-            emit OperationFeeCollected(from, operationFee);
-        }
-
-        // Pull full `amount` from `from`, credit only (amount - feeInShares) to position.
-        // `_depositCollateral` emits `CollateralDeposited` with the credited amount,
-        // so the event value exactly matches the position's state change.
-        uint256 credited = amount - feeInShares;
-        _depositCollateral(creditTo, from, tokenId, amount, credited);
-
-        // Track equity based on credited amount (post-fee)
-        positions[creditTo][tokenId].initialEquity += credited * price / 1e18;
-    }
-
-    /// @dev Internal deposit: transfers `pullAmount` CTF shares from `from` and credits `creditAmount`
-    ///      to `creditTo`'s position. When `pullAmount > creditAmount`, the difference is the fee
-    ///      (caller is responsible for adding it to `feeSharesAccumulated[tokenId]`).
-    ///      `creditTo` == `from` for direct deposits; `creditTo` != `from` for relay-based deposits
-    ///      (e.g. leverage: relayer deposits from Safe, position credited to the EOA borrower).
-    ///      The `CollateralDeposited` event emits `creditAmount` — the actual position state change.
-    function _depositCollateral(
-        address creditTo,
-        address from,
-        uint256 tokenId,
-        uint256 pullAmount,
-        uint256 creditAmount
-    ) internal {
-        if (frozenTokens[tokenId]) revert TokenFrozen();
-        if (resolvedMarkets[tokenId].resolved) revert MarketResolved();
-        if (pendingCloses[creditTo][tokenId].deadline != 0) revert PositionHasPendingClose();
-
-        ICTF(ctf).safeTransferFrom(from, address(this), tokenId, pullAmount, "");
-
-        positions[creditTo][tokenId].collateralAmount += creditAmount;
-
-        emit CollateralDeposited(creditTo, tokenId, creditAmount);
-    }
-
-    function _verifyPriceFor(uint256 expectedTokenId, PredmartOracle.PriceData calldata priceData) internal view returns (uint256) {
-        if (priceData.tokenId != expectedTokenId) revert PredmartOracle.TokenIdMismatch();
-        return PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-    }
-
-    /// @dev The borrower signs an EIP-712 WithdrawIntent off-chain specifying the destination address.
-    /// @param intent The borrower's signed intent (to, tokenId, amount, nonce, deadline)
-    /// @param intentSignature The borrower's EIP-712 signature of the intent
-    /// @param priceData Signed oracle price data (only needed if position has debt)
-    function withdrawViaRelay(
-        WithdrawIntent calldata intent,
-        bytes calldata intentSignature,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant {
-        if (msg.sender != relayer) revert NotRelayer();
-        if (block.timestamp > intent.deadline) revert IntentExpired();
-        if (intent.nonce != withdrawNonces[intent.borrower]) revert InvalidNonce();
-
-        // Verify borrower's EIP-712 signature via SignatureChecker so contract accounts
-        // (Gnosis Safes) can withdraw via EIP-1271.
-        bytes32 structHash = keccak256(abi.encode(
-            WITHDRAW_INTENT_TYPEHASH, intent.borrower, intent.to, intent.tokenId,
-            intent.amount, intent.nonce, intent.deadline
-        ));
-        bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(intent.borrower, digest, intentSignature)) {
-            revert InvalidIntentSignature();
-        }
-
-        // Consume nonce
-        withdrawNonces[intent.borrower]++;
-
-        _withdrawCollateral(intent.borrower, intent.to, intent.tokenId, intent.amount, priceData);
-    }
-
-    function _withdrawCollateral(
-        address borrower, address to, uint256 tokenId, uint256 amount,
-        PredmartOracle.PriceData calldata priceData
-    ) internal {
-        _accrueInterest();
-
-        Position storage pos = positions[borrower][tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-
-        uint256 newCollateral = pos.collateralAmount - amount;
-
-        // Verify price when: (a) debt (health check), (b) relay fee active, or (c) initialEquity > 0.
-        // Case (c) is required so initialEquity can be correctly reduced by withdrawn value;
-        // without it, value extraction via withdraw would silently understate profit-fee basis.
-        uint256 price;
-        if (pos.borrowShares > 0 || (operationFee > 0 && msg.sender == relayer) || pos.initialEquity > 0) {
-            price = _verifyPriceFor(tokenId, priceData);
-        }
-        if (pos.borrowShares > 0) {
-            uint256 debt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-            if (_getHealthFactor(newCollateral, debt, price) < 1e18) revert ExceedsLTV();
-        }
-
-        pos.collateralAmount = newCollateral;
-
-        // Reduce initialEquity by USDC value of withdrawn collateral.
-        if (pos.initialEquity > 0 && price > 0) {
-            uint256 valueWithdrawn = amount.mulDiv(price, 1e18);
-            pos.initialEquity = pos.initialEquity > valueWithdrawn ? pos.initialEquity - valueWithdrawn : 0;
-        }
-
-        // Collect fee in shares for relayed withdrawals.
-        // If fee exceeds withdrawal, take entire withdrawal as fee (spam protection —
-        // withdrawing shares worth less than $0.03 is only useful for gas drain attacks).
-        uint256 feeInShares;
-        if (operationFee > 0 && msg.sender == relayer) {
-            feeInShares = operationFee.mulDiv(1e18, price, Math.Rounding.Ceil);
-            if (feeInShares > amount) feeInShares = amount;
-            feeSharesAccumulated[tokenId] += feeInShares;
-            emit OperationFeeCollected(borrower, operationFee);
-        }
-
-        ICTF(ctf).safeTransferFrom(address(this), to, tokenId, amount - feeInShares, "");
-
-        emit CollateralWithdrawn(borrower, tokenId, amount);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                          BORROWER — BORROW (via relayer)
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Borrow USDC via meta-transaction relay. Only callable by the relayer.
-    /// @dev The borrower signs an EIP-712 BorrowIntent off-chain. The relayer (backend) attaches
-    ///      a fresh oracle price and submits both in a single transaction. This eliminates the
-    ///      oracle price staleness attack — the price is never exposed to the user.
-    /// @param intent The borrower's signed intent (tokenId, amount, nonce, deadline)
-    /// @param intentSignature The borrower's EIP-712 signature of the intent
-    /// @param priceData Signed oracle price data (signed fresh by backend at relay time)
-    function borrowViaRelay(
-        BorrowIntent calldata intent,
-        bytes calldata intentSignature,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant whenNotPaused {
-        if (msg.sender != relayer) revert NotRelayer();
-        if (block.timestamp > intent.deadline) revert IntentExpired();
-        if (intent.nonce != borrowNonces[intent.borrower]) revert InvalidNonce();
-
-        // Verify borrower's EIP-712 signature via SignatureChecker so contract accounts
-        // (Gnosis Safes) can borrow via EIP-1271.
-        bytes32 structHash = keccak256(abi.encode(
-            BORROW_INTENT_TYPEHASH, intent.borrower, intent.tokenId, intent.amount, intent.nonce, intent.deadline
-        ));
-        bytes32 digest = _hashTypedDataV4(structHash);
-        if (!SignatureChecker.isValidSignatureNow(intent.borrower, digest, intentSignature)) {
-            revert InvalidIntentSignature();
-        }
-
-        // Consume nonce
-        borrowNonces[intent.borrower]++;
-
-        if (priceData.tokenId != intent.tokenId) revert PredmartOracle.TokenIdMismatch();
-        uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-
-        _accrueInterest();
-        _executeBorrow(intent.borrower, intent.tokenId, intent.amount, price, priceData.maxBorrow, intent.borrower, true);
-    }
-
-    /// @dev Verifies `allowedFrom` consents via EIP-1271/ECDSA signature over the auth hash.
-    ///      No-op when `allowedFrom == borrower` (self-authorization, signature redundant).
-    ///      Extracted to avoid stack-too-deep in leverageDeposit.
-    function _verifyAllowedFromSig(
-        address allowedFrom,
-        address borrower,
-        bytes32 authHash,
-        bytes calldata fromSignature
-    ) internal view {
-        if (allowedFrom == borrower) return;
-        if (!SignatureChecker.isValidSignatureNow(allowedFrom, authHash, fromSignature)) {
-            revert InvalidIntentSignature();
-        }
-    }
-
-    /// @notice Deposit collateral + formalize borrow for a leverage operation.
-    /// @dev Only callable by the relayer. User must sign a LeverageAuth EIP-712 message authorizing
-    ///      a maximum borrow budget. The contract verifies the signature and tracks cumulative borrowing
-    ///      against the budget. The auth is consumed (nonce incremented) on first use and expires at deadline.
-    ///      Typical flow: pullUsdcForLeverage() advances pool USDC to relayer → relayer buys shares on
-    ///      CLOB → leverageDeposit() deposits all shares and formalizes the advance as real debt.
-    ///
-    ///      NONCE DESIGN: Nonce is consumed on first borrow, NOT on deposit-only calls.
-    ///      Deposit-only calls (borrowAmount=0) are used to add pre-existing Safe shares as collateral
-    ///      before the main deposit+borrow call. Replay safety is provided by the `fromSignature`
-    ///      requirement below: deposits from `allowedFrom` require that address's explicit consent,
-    ///      so an attacker cannot replay a deposit-only call against a victim's Safe.
-    ///
-    ///      When pulling shares from `allowedFrom` (i.e. `from == allowedFrom` and
-    ///      `allowedFrom != borrower`), `fromSignature` must be a valid EIP-712 signature from
-    ///      `allowedFrom` over the same LeverageAuth hash. Validated via
-    ///      `SignatureChecker.isValidSignatureNow` (supports both ECDSA and EIP-1271), ensuring
-    ///      that a Gnosis Safe's threshold of owners explicitly consents to the share deposit.
-    /// @param auth The user's leverage authorization (tokenId, maxBorrow budget, nonce, deadline)
-    /// @param authSignature Borrower's EIP-712 signature of the LeverageAuth
-    /// @param fromSignature `allowedFrom`'s EIP-712 signature over the same LeverageAuth hash.
-    ///                     Only required when pulling shares from `allowedFrom` (i.e. `data.from == allowedFrom`
-    ///                     AND `allowedFrom != borrower` AND `data.depositAmount > 0`). Pass empty bytes otherwise.
-    /// @param data Bundled call parameters (from, borrowTo, depositAmount, borrowAmount)
-    /// @param priceData Signed oracle price data (required when borrowAmount > 0)
-    function leverageDeposit(
-        LeverageAuth calldata auth,
-        bytes calldata authSignature,
-        bytes calldata fromSignature,
-        LeverageDepositData calldata data,
-        PredmartOracle.PriceData calldata priceData
-    ) external nonReentrant whenNotPaused {
-        // Validate `from`: must be the user-signed allowedFrom OR the relayer itself
-        if (data.from != auth.allowedFrom && data.from != relayer) revert InvalidAddress();
-        // Validate `borrowTo`: same rule — either allowedFrom or relayer
-        if (data.borrowTo != auth.allowedFrom && data.borrowTo != relayer) revert InvalidAddress();
-
-        if (msg.sender != relayer) revert NotRelayer();
-        if (block.timestamp > auth.deadline) revert IntentExpired();
-
-        bytes32 structHash = keccak256(abi.encode(
-            LEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedFrom, auth.tokenId,
-            auth.maxBorrow, auth.nonce, auth.deadline
-        ));
-        bytes32 authHash = _hashTypedDataV4(structHash);
-        // SignatureChecker supports contract-account borrowers (Safes) signing LeverageAuth via EIP-1271.
-        if (!SignatureChecker.isValidSignatureNow(auth.borrower, authHash, authSignature)) revert InvalidIntentSignature();
-
-        // Require `allowedFrom`'s explicit consent when pulling its CTF shares.
-        // A borrower-only signature is insufficient — without this check, a user could sign
-        // a LeverageAuth with their own key but set `allowedFrom` to any CTF-approved third party.
-        if (data.depositAmount > 0 && data.from != relayer) {
-            _verifyAllowedFromSig(auth.allowedFrom, auth.borrower, authHash, fromSignature);
-        }
-
-        _accrueInterest();
-
-        if (data.depositAmount > 0) {
-            // Deposit-only path (no borrow this round) consumes a one-shot per authHash slot.
-            // Allowed at most once per auth and never after any borrow has been formalized.
-            // Combined deposit+borrow calls (borrowAmount > 0) are gated by maxBorrow budget instead.
-            if (data.borrowAmount == 0) {
-                if (leverageBorrowUsed[authHash] > 0) revert AuthAlreadyUsed();
-                if (leverageDepositOnlyConsumed[authHash]) revert AuthAlreadyUsed();
-                leverageDepositOnlyConsumed[authHash] = true;
-            }
-            _depositCollateral(auth.borrower, data.from, auth.tokenId, data.depositAmount, data.depositAmount);
-        }
-
-        if (data.borrowAmount > 0) {
-            // Consume nonce on first borrow, not on deposit-only calls (see NONCE DESIGN NatSpec above)
-            bool isFirstBorrow = (leverageBorrowUsed[authHash] == 0);
-            if (isFirstBorrow) {
-                if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
-                leverageNonces[auth.borrower]++;
-            }
-
-            // Settle pending advance (v1.5.0): advance was already counted in
-            // leverageBorrowUsed by pullUsdcForLeverage, so only count the excess.
-            uint256 advance = pendingAdvances[authHash];
-            if (advance > 0) {
-                uint256 settled = advance > data.borrowAmount ? data.borrowAmount : advance;
-                pendingAdvances[authHash] = advance - settled;
-                totalPendingAdvances -= settled;
-                if (pendingAdvances[authHash] == 0) delete pendingAdvanceTimestamps[authHash];
-                _advanceOffset = settled;
-            }
-
-            // Enforce cumulative borrow budget (advance portion already counted)
-            uint256 effectiveNewBorrow = data.borrowAmount > advance ? data.borrowAmount - advance : 0;
-            uint256 newTotal = leverageBorrowUsed[authHash] + effectiveNewBorrow;
-            if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
-            leverageBorrowUsed[authHash] = newTotal;
-
-            if (priceData.tokenId != auth.tokenId) revert PredmartOracle.TokenIdMismatch();
-            uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-            _executeBorrow(auth.borrower, auth.tokenId, data.borrowAmount, price, priceData.maxBorrow, data.borrowTo, isFirstBorrow);
-
-            _advanceOffset = 0;
-        }
-    }
-
-    // initiateClose moved to PredmartPoolExtension (EIP-170 size limit).
-    // Called via fallback delegatecall — same function selector, transparent to callers.
-
-    /// @dev Core borrow execution — shared by borrowViaRelay (USDC→EOA) and leverageDeposit (USDC→Safe).
-    ///      Caller must call _accrueInterest() before this function.
-    /// @param borrower Position owner
-    /// @param tokenId Token ID of the position
-    /// @param amount USDC to borrow (6 decimals)
-    /// @param price Verified oracle price in WAD
-    /// @param maxBorrowDepthCap Depth-gate borrow cap from oracle price data
-    /// @param sendTo Address to receive borrowed USDC
-    function _executeBorrow(
-        address borrower, uint256 tokenId, uint256 amount,
-        uint256 price, uint256 maxBorrowDepthCap, address sendTo,
-        bool chargeFee
-    ) internal {
-        if (frozenTokens[tokenId]) revert TokenFrozen();
-        if (resolvedMarkets[tokenId].resolved) revert MarketResolved();
-
-        Position storage pos = positions[borrower][tokenId];
-        if (pos.collateralAmount == 0) revert NoPosition();
-
-        // Check LTV constraint
-        uint256 currentDebt = pos.borrowShares > 0
-            ? _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil)
-            : 0;
-        uint256 collateralValue = pos.collateralAmount.mulDiv(price, 1e18);
-        uint256 ltv = getLTV(price);
-        uint256 maxBorrow = collateralValue.mulDiv(ltv, 1e18);
-        if (currentDebt + amount > maxBorrow) revert ExceedsLTV();
-        if (currentDebt + amount < MIN_BORROW) revert BorrowTooSmall();
-
-        // Per-token borrow cap
-        if (poolCapBps > 0) {
-            uint256 tokenCap = totalAssets().mulDiv(poolCapBps, 10000);
-            if (totalBorrowedPerToken[tokenId] + amount > tokenCap) revert ExceedsTokenCap();
-        }
-
-        // Depth-gate cap
-        if (totalBorrowedPerToken[tokenId] + amount > maxBorrowDepthCap) revert DepthCapExceeded();
-
-        // Check liquidity (offset by advance already sent to relayer)
-        uint256 offset = _advanceOffset;
-        if (offset > amount) offset = amount; // Defensive: prevent underflow
-        if (amount - offset > _availableCash()) revert InsufficientLiquidity();
-
-        // Convert amount to borrow shares (round UP)
-        uint256 shares = _toBorrowShares(amount, Math.Rounding.Ceil);
-
-        // Update state
-        pos.borrowShares += shares;
-        pos.borrowedPrincipal += amount;
-        totalBorrowAssets += amount;
-        totalBorrowShares += shares;
-        totalBorrowedPerToken[tokenId] += amount;
-
-        // Track initial equity for profit fee (CEI pattern — must precede transfer).
-        // First borrow: set initialEquity to net equity (collateralValue - totalDebt).
-        // Subsequent borrows: reduce initialEquity by extracted USDC (amount - offset).
-        // The leverage-advance portion (offset) does NOT reduce initialEquity because
-        // pullUsdcForLeverage already credited userAmount; the offset is internal accounting.
-        if (pos.initialEquity == 0) {
-            uint256 totalDebt = _toBorrowAssets(pos.borrowShares, Math.Rounding.Ceil);
-            pos.initialEquity = collateralValue > totalDebt ? collateralValue - totalDebt : 0;
-        } else {
-            uint256 extracted = amount > offset ? amount - offset : 0;
-            if (extracted > 0) {
-                pos.initialEquity = pos.initialEquity > extracted ? pos.initialEquity - extracted : 0;
-            }
-        }
-
-        // Transfer USDC (deduct operation fee + advance offset).
-        // When offset > 0, fee was already charged in pullUsdcForLeverage — skip here.
-        uint256 fee = (chargeFee && offset == 0) ? operationFee : 0;
-        if (fee > 0) {
-            operationFeePool += fee;
-            emit OperationFeeCollected(borrower, fee);
-        }
-        uint256 deductions = fee + offset;
-        uint256 toSend = amount > deductions ? amount - deductions : 0;
-        if (toSend > 0) {
-            IERC20(asset()).safeTransfer(sendTo, toSend);
-        }
-
-        emit Borrowed(borrower, tokenId, amount);
-    }
+    // ──────────────────────────────────────────────────────────────────
+    // The following functions have been moved to PredmartBorrowExtension:
+    //   borrowViaRelay, leverageDeposit, withdrawViaRelay,
+    //   depositCollateralFrom, _executeBorrow, _verifyAllowedFromSig,
+    //   _depositCollateral, _withdrawCollateral.
+    // Reached via the selector-routed fallback() at the bottom of this file.
+    // ──────────────────────────────────────────────────────────────────
 
     // repay() moved to PredmartPoolExtension (EIP-170 size limit)
     // Accessible at same address via fallback() → delegatecall
@@ -1070,12 +579,13 @@ contract PredmartLendingPool is
                           EXTENSION FALLBACK
     //////////////////////////////////////////////////////////////*/
 
-    /// @dev Delegate unknown function calls to the extension contract.
-    ///      Reentrancy guard is implemented manually because the Solidity nonReentrant modifier
-    ///      is incompatible with assembly return (return skips modifier cleanup, leaving the guard
-    ///      permanently locked). Uses the same ERC-7201 storage slot as OZ ReentrancyGuard.
+    /// @dev Selector-routed fallback. Each function selector is mapped to either the
+    ///      lifecycle extension (PoolExtension) or the borrow extension (BorrowExtension)
+    ///      via `extensionForSelector`. Falls back to the legacy `extension` field for
+    ///      any selector not explicitly routed (transitional behavior).
     fallback() external {
-        address ext = extension;
+        address ext = extensionForSelector[msg.sig];
+        if (ext == address(0)) ext = extension; // fallback for unrouted selectors
         if (ext == address(0)) revert InvalidAddress();
         bytes32 guardSlot = 0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00;
         assembly {
@@ -1091,6 +601,20 @@ contract PredmartLendingPool is
             switch result
             case 0 { revert(0, returndatasize()) }
             default { return(0, returndatasize()) }
+        }
+    }
+
+    /// @notice Bind a batch of selectors to a target extension. Timelock-respecting:
+    ///         instant only when no extension is currently registered for the selector,
+    ///         OR timelockDelay == 0 (bootstrap mode).
+    function setExtensionSelectors(bytes4[] calldata selectors, address ext) external onlyAdmin {
+        if (ext == address(0)) revert InvalidAddress();
+        for (uint256 i = 0; i < selectors.length; i++) {
+            address current = extensionForSelector[selectors[i]];
+            if (current != address(0) && current != ext && timelockDelay > 0) {
+                revert TimelockNotReady();
+            }
+            extensionForSelector[selectors[i]] = ext;
         }
     }
 

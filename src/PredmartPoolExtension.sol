@@ -3,7 +3,6 @@
 pragma solidity ^0.8.24;
 
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -44,6 +43,10 @@ contract PredmartPoolExtension {
         "CloseAuth(address borrower,address allowedTo,uint256 tokenId,uint256 nonce,uint256 deadline)"
     );
 
+    /// @notice Polymarket V2 pUSD token. Used for two-token settle close (surplus to user as pUSD).
+    ///         Hardcoded to Polygon mainnet; redeploy for other networks.
+    address public constant PUSD = 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB;
+
     /*//////////////////////////////////////////////////////////////
                               ERRORS
     //////////////////////////////////////////////////////////////*/
@@ -58,17 +61,21 @@ contract PredmartPoolExtension {
     error RedemptionFailed();
     error UseRedemptionFlow();
     error NoPendingClose();
-    error InsufficientLiquidity();
     error NoPendingAdvance();
     error CloseNotExpired();
     error FeeTooHigh();
     error MarketResolved();
-    error AdvanceTooSmall();
     error PositionHealthy();
     error PositionUnhealthy();
     error PositionHasPendingClose();
     error ProtocolPaused();
     error TooEarly();
+    error SettleAmountMismatch();
+    error InvalidAmount();
+    // Errors for initiateClose
+    error IntentExpired();
+    error InvalidIntentSignature();
+    error InvalidNonce();
 
     event Liquidated(address indexed liquidator, address indexed borrower, uint256 indexed tokenId, uint256 collateralSeized, uint256 debtAmount);
 
@@ -208,13 +215,6 @@ contract PredmartPoolExtension {
         _;
     }
 
-    // Errors for pullUsdcForLeverage (defined in main contract, redeclared here for the extension)
-    error BorrowTooSmall();
-    error IntentExpired();
-    error InvalidIntentSignature();
-    error InvalidNonce();
-    error ExceedsBorrowBudget();
-    error NotLeverageModule();
 
     /*//////////////////////////////////////////////////////////////
                       ADMIN — INSTANT (safe operations)
@@ -332,7 +332,7 @@ contract PredmartPoolExtension {
     }
 
     /// @notice Set the operation fee for relayed transactions (instant, no timelock)
-    /// @param newFee Fee in USDC (6 decimals). E.g. 30000 = $0.03
+    /// @param newFee Fee in USDC (6 decimals). E.g. 10000 = $0.01
     function setOperationFee(uint256 newFee) external onlyAdmin {
         if (newFee > MAX_OPERATION_FEE) revert FeeTooHigh();
         operationFee = newFee;
@@ -625,6 +625,10 @@ contract PredmartPoolExtension {
     }
 
     /// @notice Settle a borrower's position after CTF redemption. Permissionless.
+    /// @dev Surplus is sent to position.recipient (set at borrow / leverage-open time, =
+    ///      user's Safe in V2-native flows). The recipient is signed by the user; settle
+    ///      remains permissionless because anyone calling settleRedemption can only
+    ///      route to the address the user pre-authorized.
     function settleRedemption(address borrower, uint256 tokenId) external {
         Redemption storage redemption = redeemedTokens[tokenId];
         if (!redemption.redeemed) revert TokenNotRedeemed();
@@ -633,6 +637,9 @@ contract PredmartPoolExtension {
 
         Position storage pos = positions[borrower][tokenId];
         if (pos.collateralAmount == 0) revert NoPosition();
+
+        address recipient = pos.recipient;
+        if (recipient == address(0)) revert InvalidAddress();
 
         uint256 proceeds = pos.collateralAmount.mulDiv(redemption.usdcReceived, redemption.totalShares, Math.Rounding.Floor);
         uint256 debt = pos.borrowShares > 0
@@ -664,7 +671,7 @@ contract PredmartPoolExtension {
         delete positions[borrower][tokenId];
 
         if (surplus > 0) {
-            IERC20(_asset()).safeTransfer(borrower, surplus);
+            IERC20(_asset()).safeTransfer(recipient, surplus);
         }
 
         emit RedemptionSettled(borrower, tokenId, debt, surplus);
@@ -780,12 +787,18 @@ contract PredmartPoolExtension {
         }
     }
 
-    /// @notice Expire a pending liquidation that wasn't settled within CLOSE_TIMEOUT.
-    /// @dev Permissionless — anyone can call after timeout. Full debt becomes bad debt.
+    /// @notice Expire a pending liquidation that wasn't settled within 48 hours.
+    ///         Permissionless after 48 hours; `admin` and `liquidator` may expire immediately.
+    /// @dev Full debt amount becomes bad debt, socialized to lenders. The position's debt
+    ///      was already zeroed in liquidate(), so expiring just cleans up the slot — no
+    ///      money moves. Granting the liquidator instant-expire lets the bot mark a CLOB
+    ///      sale as conclusively failed without holding the slot open for 48 hours.
     function expirePendingLiquidation(address borrower, uint256 tokenId) external {
         PendingLiquidation memory pending = pendingLiquidations[borrower][tokenId];
         if (pending.liquidator == address(0)) revert NoPendingLiquidation();
-        if (block.timestamp < pending.timestamp + 48 hours) revert TooEarly();
+        if (msg.sender != admin && msg.sender != liquidator) {
+            if (block.timestamp < pending.timestamp + 48 hours) revert TooEarly();
+        }
 
         totalPendingLiquidations = totalPendingLiquidations > pending.debt
             ? totalPendingLiquidations - pending.debt : 0;
@@ -868,11 +881,23 @@ contract PredmartPoolExtension {
     }
 
     /// @notice Settle a pending flash close after the relayer sold shares on CLOB.
-    /// @dev Only callable by relayer. v2: deducts profit fee (10% of profit above initial equity).
+    /// @dev Only callable by relayer. Two-token settlement (V2-native):
+    ///      - relayer pays debt + protocol-tied fees in USDC.e (lender-side accounting)
+    ///      - relayer pays user surplus in pUSD (so user keeps Polymarket-ready currency)
+    ///      Caller pre-computes the split off-chain; this function verifies it matches the
+    ///      contract's own debt/fee/surplus math. Mismatch reverts.
+    /// @dev Bad debt scenario: relayer sets surplusPusd = 0 and debtAndFeeUsdce equal to all
+    ///      proceeds (relayer unwrapped everything, pool absorbs the shortfall).
     /// @param borrower The position owner
     /// @param tokenId The token ID of the closed position
-    /// @param saleProceeds USDC received from CLOB sale (6 decimals)
-    function settleClose(address borrower, uint256 tokenId, uint256 saleProceeds) external {
+    /// @param debtAndFeeUsdce Amount of USDC.e the relayer is delivering (covers repaid debt + total profit fee)
+    /// @param surplusPusd Amount of pUSD the relayer is delivering (= user's net surplus, sent to position's recipient)
+    function settleClose(
+        address borrower,
+        uint256 tokenId,
+        uint256 debtAndFeeUsdce,
+        uint256 surplusPusd
+    ) external {
         if (msg.sender != relayer) revert NotRelayer();
 
         PendingClose storage pending = pendingCloses[borrower][tokenId];
@@ -882,6 +907,7 @@ contract PredmartPoolExtension {
         uint256 debtAmount = pending.debtAmount;
         address surplusRecipient = pending.surplusRecipient;
         uint256 initialEquity = pending.initialEquity;
+        uint256 saleProceeds = debtAndFeeUsdce + surplusPusd;
 
         uint256 surplus = saleProceeds > debtAmount ? saleProceeds - debtAmount : 0;
         uint256 badDebt = debtAmount > saleProceeds ? debtAmount - saleProceeds : 0;
@@ -890,14 +916,23 @@ contract PredmartPoolExtension {
         // Profit fee: 10% of profit (surplus above initial equity)
         // 7% stays in pool (increases lender yield), 3% → protocol fee pool
         // Legacy positions (initialEquity == 0) are exempt
+        uint256 expectedFee = 0;
         if (initialEquity > 0 && surplus > initialEquity) {
             uint256 profit = surplus - initialEquity;
             uint256 poolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_POOL, 1e18);
             uint256 protocolFee = profit.mulDiv(PredmartPoolLib.PROFIT_FEE_PROTOCOL, 1e18);
-            surplus -= (poolFee + protocolFee);
+            expectedFee = poolFee + protocolFee;
+            surplus -= expectedFee;
             protocolFeePool += protocolFee;
             emit ProfitFeeCollected(borrower, tokenId, poolFee, protocolFee);
         }
+
+        // Verify relayer's split matches contract's math:
+        //   USDC.e portion = repaid (debt or partial-debt) + expectedFee
+        //   pUSD portion   = surplus (after fee deduction)
+        // If split is wrong (relayer cheated or miscomputed), revert — pool side is non-negotiable.
+        if (debtAndFeeUsdce != repaid + expectedFee) revert SettleAmountMismatch();
+        if (surplusPusd != surplus) revert SettleAmountMismatch();
 
         // ── Effects ──
         totalPendingCloses = totalPendingCloses > debtAmount ? totalPendingCloses - debtAmount : 0;
@@ -909,23 +944,31 @@ contract PredmartPoolExtension {
         }
 
         // ── Interactions ──
-        address asset_ = _asset();
-        if (saleProceeds > 0) {
-            IERC20(asset_).safeTransferFrom(msg.sender, address(this), saleProceeds);
+        if (debtAndFeeUsdce > 0) {
+            IERC20(_asset()).safeTransferFrom(msg.sender, address(this), debtAndFeeUsdce);
         }
-        if (surplus > 0) {
-            IERC20(asset_).safeTransfer(surplusRecipient, surplus);
+        if (surplusPusd > 0) {
+            // Pull pUSD from relayer and forward to user's Safe in one trustless step.
+            // Relayer must have pUSD → LendingPool approval (set during V2 onboarding).
+            IERC20(PUSD).safeTransferFrom(msg.sender, surplusRecipient, surplusPusd);
         }
     }
 
-    /// @notice Expire a timed-out pending close. Permissionless — anyone can call after deadline.
-    /// @dev Full debt amount becomes bad debt, socialized to lenders.
+    /// @notice Expire a timed-out pending close. Permissionless after the deadline;
+    ///         `admin` and `relayer` may expire immediately.
+    /// @dev Full debt amount becomes bad debt, socialized to lenders. The pool's debt
+    ///      was already zeroed in initiateClose, so expiring just cleans up the slot —
+    ///      no money moves. Granting the relayer instant-expire lets the backend close
+    ///      out the slot as soon as a CLOB sale is conclusively confirmed failed,
+    ///      instead of waiting the full 48-hour deadline.
     /// @param borrower The position owner
     /// @param tokenId The token ID of the closed position
     function expirePendingClose(address borrower, uint256 tokenId) external {
         PendingClose storage pending = pendingCloses[borrower][tokenId];
         if (pending.deadline == 0) revert NoPendingClose();
-        if (block.timestamp < pending.deadline) revert CloseNotExpired();
+        if (msg.sender != admin && msg.sender != relayer) {
+            if (block.timestamp < pending.deadline) revert CloseNotExpired();
+        }
 
         uint256 badDebt = pending.debtAmount;
 
@@ -945,14 +988,23 @@ contract PredmartPoolExtension {
 
     event AdvanceExpired(bytes32 indexed authHash, uint256 amount);
 
-    /// @notice Expire a stuck pending advance. Permissionless after CLOSE_TIMEOUT; admin can expire immediately.
-    /// @dev When the relayer received an advance but never called leverageDeposit, the advance
-    ///      sits in the relayer wallet. After timeout, anyone can expire it (bad debt socialized).
-    ///      Admin should recover USDC from relayer first to avoid pool loss.
+    /// @notice Expire a stuck pending advance. Permissionless after 48 hours;
+    ///         `admin` and `relayer` may expire immediately.
+    /// @dev When the relayer received an advance but never called leverageDeposit, the
+    ///      USDC sits in the relayer wallet. The relayer's auto-recovery (Phase A) returns
+    ///      that USDC to the pool via plain ERC-20 transfer, but `pendingAdvances` and
+    ///      `totalPendingAdvances` are not cleared by an ERC-20 transfer. Until cleared,
+    ///      `totalAssets()` over-reports the pool by the gross advance amount, leading to
+    ///      a temporary pUSDC inflation visible to lenders. Granting the relayer instant-
+    ///      expire lets the backend hourly sweep clear Phase A advances within minutes
+    ///      instead of waiting 48 hours.
+    ///
+    ///      The 48-hour permissionless path is preserved as a backstop: if the relayer is
+    ///      down or compromised, anyone can clean up after the timer.
     function expireAdvance(bytes32 authHash) external {
         uint256 amount = pendingAdvances[authHash];
         if (amount == 0) revert NoPendingAdvance();
-        if (msg.sender != admin) {
+        if (msg.sender != admin && msg.sender != relayer) {
             if (block.timestamp < pendingAdvanceTimestamps[authHash] + 48 hours) revert TooEarly();
         }
         pendingAdvances[authHash] = 0;
@@ -983,116 +1035,15 @@ contract PredmartPoolExtension {
         emit ReservesWithdrawn(admin, amount);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                    LEVERAGE — USDC PULL FOR INITIAL BUY
-    //////////////////////////////////////////////////////////////*/
+    // pullUsdcForLeverage moved to PredmartBorrowExtension. Reachable via selector-routed fallback.
 
-    bytes32 private constant LEVERAGE_AUTH_TYPEHASH = keccak256(
-        "LeverageAuth(address borrower,address allowedFrom,uint256 tokenId,uint256 maxBorrow,uint256 nonce,uint256 deadline)"
-    );
-
-    struct LeverageAuth {
-        address borrower;
-        address allowedFrom;
-        uint256 tokenId;
-        uint256 maxBorrow;
-        uint256 nonce;
-        uint256 deadline;
-    }
-
+    /// @dev CloseAuth struct used by initiateClose (still in this extension).
     struct CloseAuth {
         address borrower;
         address allowedTo;
         uint256 tokenId;
         uint256 nonce;
         uint256 deadline;
-    }
-
-    event UsdcPulledForLeverage(address indexed borrower, address indexed from, uint256 amount, uint256 indexed tokenId);
-    event PoolAdvancedForLeverage(address indexed borrower, uint256 advanceAmount, uint256 indexed tokenId);
-    event StaleInitialEquityCleared(address indexed borrower, uint256 indexed tokenId, uint256 amount);
-
-    /// @notice Module-only entry: pool-side accounting + USDC advance for a leverage
-    ///         open. The PredmartLeverageModule has already verified the borrower's
-    ///         signature, confirmed Safe ownership, and pulled `userAmount` USDC from
-    ///         the Safe to the relayer via execTransactionFromModule before calling.
-    /// @dev    Trust model: msg.sender is the registered `leverageModule`. Module is
-    ///         enabled on the user's Safe and is responsible for credential checks.
-    ///         The pool re-derives `authHash` from `auth` so a malicious module cannot
-    ///         redirect accounting to a forged hash.
-    /// @param  auth           User's leverage authorization (sig already verified by module).
-    /// @param  userAmount     USDC the module transferred Safe → relayer (counted against maxBorrow).
-    /// @param  advanceAmount  USDC the pool advances to relayer (formalized as borrow in leverageDeposit).
-    function pullUsdcForLeverage(
-        LeverageAuth calldata auth,
-        uint256 userAmount,
-        uint256 advanceAmount
-    ) external {
-        if (msg.sender != leverageModule) revert NotLeverageModule();
-        if (paused) revert ProtocolPaused();
-        if (resolvedMarkets[auth.tokenId].resolved) revert MarketResolved();
-        if (frozenTokens[auth.tokenId]) revert TokenFrozen();
-        if (block.timestamp > auth.deadline) revert IntentExpired();
-        if (userAmount == 0 && advanceAmount == 0) revert BorrowTooSmall();
-
-        bytes32 structHash = keccak256(abi.encode(
-            LEVERAGE_AUTH_TYPEHASH, auth.borrower, auth.allowedFrom, auth.tokenId,
-            auth.maxBorrow, auth.nonce, auth.deadline
-        ));
-        bytes32 authHash = _hashTypedDataV4Ext(structHash);
-
-        // Consume nonce on first use.
-        bool isFirstUse = (leverageBorrowUsed[authHash] == 0);
-        if (isFirstUse) {
-            if (auth.nonce != leverageNonces[auth.borrower]) revert InvalidNonce();
-            leverageNonces[auth.borrower]++;
-        }
-
-        // SECURITY: track BOTH user pull AND pool advance against maxBorrow.
-        // userAmount is NOT in the typehash, so maxBorrow must bound total
-        // Safe-USDC extraction even with standing module privilege.
-        uint256 newTotal = leverageBorrowUsed[authHash] + userAmount + advanceAmount;
-        if (newTotal > auth.maxBorrow) revert ExceedsBorrowBudget();
-        leverageBorrowUsed[authHash] = newTotal;
-
-        // Track user equity for profit-fee calculation. NO transferFrom here — the
-        // module already pulled `userAmount` from the Safe to the relayer in the
-        // same tx via execTransactionFromModule.
-        if (userAmount > 0) {
-            Position storage pos = positions[auth.borrower][auth.tokenId];
-            // If the position is verifiably empty (no collateral, no debt) but carries
-            // a non-zero initialEquity, it is stale residue from a prior failed leverage
-            // (pull succeeded, deposit reverted) or a price-skewed full withdrawal.
-            // Reset before the new stamp so the fresh leverage starts from clean basis.
-            if (pos.collateralAmount == 0 && pos.borrowShares == 0 && pos.initialEquity > 0) {
-                emit StaleInitialEquityCleared(auth.borrower, auth.tokenId, pos.initialEquity);
-                pos.initialEquity = 0;
-            }
-            pos.initialEquity += userAmount;
-            emit UsdcPulledForLeverage(auth.borrower, auth.allowedFrom, userAmount, auth.tokenId);
-        }
-
-        // Pool advance: liquidity check + fee + transfer to relayer.
-        if (advanceAmount > 0) {
-            uint256 fee = operationFee;
-            if (advanceAmount <= fee) revert AdvanceTooSmall();
-            uint256 netAdvance = advanceAmount - fee;
-            operationFeePool += fee;
-            emit OperationFeeCollected(auth.borrower, fee);
-
-            uint256 cash = IERC20(_asset()).balanceOf(address(this));
-            if (cash > totalReserves) cash -= totalReserves; else cash = 0;
-            if (cash > unsettledRedemptions) cash -= unsettledRedemptions; else cash = 0;
-            if (cash > operationFeePool) cash -= operationFeePool; else cash = 0;
-            if (cash > protocolFeePool) cash -= protocolFeePool; else cash = 0;
-            if (netAdvance > cash) revert InsufficientLiquidity();
-
-            pendingAdvances[authHash] += advanceAmount;
-            totalPendingAdvances += advanceAmount;
-            pendingAdvanceTimestamps[authHash] = block.timestamp;
-            IERC20(_asset()).safeTransfer(relayer, netAdvance);
-            emit PoolAdvancedForLeverage(auth.borrower, netAdvance, auth.tokenId);
-        }
     }
 
     /// @dev Compute EIP-712 typed data hash matching the main contract's _hashTypedDataV4.
@@ -1121,23 +1072,44 @@ contract PredmartPoolExtension {
     /// @notice Deposit CTF shares as collateral directly from `msg.sender` (no Safe proxy).
     /// @dev Users with Polymarket proxy Safes should use `depositCollateralFrom` with an EIP-712 signature.
     ///      This path exists for users holding shares in their EOA.
-    function depositCollateral(uint256 tokenId, uint256 amount, PredmartOracle.PriceData calldata priceData) external {
+    /// @notice Deposit ERC-1155 collateral on behalf of `borrower`. The shares
+    ///         are pulled from `msg.sender` (the funds source) and credited to
+    ///         `positions[borrower][tokenId]` (the position key). Separating
+    ///         the two lets a Polymarket Safe deposit shares while the position
+    ///         remains keyed to the user's EOA — required for V2-native flows
+    ///         where pUSD/CTF balances live on the Safe but identity is the EOA.
+    /// @dev    Caller (msg.sender) must hold the shares AND have setApprovalForAll
+    ///         granted to this pool. There is no signature check on `borrower`:
+    ///         depositing collateral on someone else's position can only ADD
+    ///         value to it (collateral and initialEquity both grow), so it is
+    ///         safe to permit unsolicited credits — same trust model as paying
+    ///         off someone else's loan in repay().
+    function depositCollateral(
+        address borrower,
+        uint256 tokenId,
+        uint256 amount,
+        PredmartOracle.PriceData calldata priceData
+    ) external {
         if (paused) revert ProtocolPaused();
+        // Reject no-op calls at the contract layer. Pre-V19 a zero-amount
+        // call succeeded silently and emitted a CollateralDeposited event,
+        // letting a griefer flood the indexer / DB with noise rows for the
+        // cost of one tx of gas. Backend rate limits aren't real security
+        // (see internal feedback) — close the vector at the source.
+        if (amount == 0) revert InvalidAmount();
 
-        // Inline deposit — mirrors PredmartLendingPool._depositCollateral
         if (frozenTokens[tokenId]) revert TokenFrozen();
         if (resolvedMarkets[tokenId].resolved) revert MarketResolved();
-        if (pendingCloses[msg.sender][tokenId].deadline != 0) revert PositionHasPendingClose();
+        if (pendingCloses[borrower][tokenId].deadline != 0) revert PositionHasPendingClose();
 
         ICTF(ctf).safeTransferFrom(msg.sender, address(this), tokenId, amount, "");
-        positions[msg.sender][tokenId].collateralAmount += amount;
+        positions[borrower][tokenId].collateralAmount += amount;
 
-        // Track initial equity for profit fee
         if (priceData.tokenId != tokenId) revert PredmartOracle.TokenIdMismatch();
         uint256 price = PredmartOracle.verifyPrice(priceData, oracle, address(this), MAX_RELAY_PRICE_AGE);
-        positions[msg.sender][tokenId].initialEquity += amount * price / 1e18;
+        positions[borrower][tokenId].initialEquity += amount * price / 1e18;
 
-        emit CollateralDeposited(msg.sender, tokenId, amount);
+        emit CollateralDeposited(borrower, tokenId, amount);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -1146,10 +1118,19 @@ contract PredmartPoolExtension {
 
     /// @notice Repay USDC debt for a position. Called via fallback → delegatecall from proxy.
     /// @dev Reentrancy protected by the proxy fallback's ERC-7201 guard.
-    function repay(uint256 tokenId, uint256 amount) external {
+    /// @notice Repay debt on `borrower`'s position. USDC.e is pulled from
+    ///         msg.sender (the funds source); the debt is reduced on
+    ///         positions[borrower][tokenId] (the position key). V2-native:
+    ///         a Polymarket Safe pays USDC.e on behalf of the EOA-keyed
+    ///         position. Permitting third-party repay is safe — paying down
+    ///         someone else's debt only IMPROVES their health factor.
+    function repay(address borrower, uint256 tokenId, uint256 amount) external {
+        // Reject no-op calls so a spammer can't bloat the indexer / DB with
+        // zero-amount Repaid events. Symmetric with depositCollateral.
+        if (amount == 0) revert InvalidAmount();
         _accrueInterestInline();
 
-        Position storage pos = positions[msg.sender][tokenId];
+        Position storage pos = positions[borrower][tokenId];
         if (pos.borrowShares == 0) revert NoPosition();
 
         uint256 currentDebt = _toBorrowAssetsInline(pos.borrowShares);
@@ -1169,6 +1150,6 @@ contract PredmartPoolExtension {
         pos.borrowShares -= sharesToBurn;
         _reduceBorrowTrackingInline(tokenId, repayAmount, sharesToBurn, pr);
 
-        emit Repaid(msg.sender, tokenId, repayAmount);
+        emit Repaid(borrower, tokenId, repayAmount);
     }
 }

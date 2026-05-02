@@ -16,6 +16,7 @@ struct Position {
     uint256 lastDepositTimestamp; // DEPRECATED — kept for storage layout compatibility
     uint256 borrowedPrincipal;   // v0.9.1 — cumulative USDC principal borrowed (for accurate per-token cap tracking)
     uint256 initialEquity;       // v2.0.0 — user's USDC equity for profit fee calculation
+    address recipient;           // V2-native — destination for borrowed USDC and resolution surplus (user's Safe)
 }
 
 struct MarketResolution {

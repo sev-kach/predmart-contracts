@@ -223,7 +223,7 @@ The `proposeUpgrade` script deploys both a new `PredmartLendingPool` implementat
 | Profit fee | 10% of borrower profit (7% to pool, 3% to protocol) |
 | Liquidation model | Full collateral seizure |
 | Liquidator fee | 5% of debt amount |
-| Operation fee | $0.03 per relayed operation |
+| Operation fee | Live value via `operationFee()` on the pool proxy |
 
 ---
 

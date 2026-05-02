@@ -14,6 +14,7 @@ import { Script, console } from "forge-std/Script.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { PredmartLendingPool } from "../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../src/PredmartPoolExtension.sol";
+import { PredmartBorrowExtension } from "../src/PredmartBorrowExtension.sol";
 import { PredmartLeverageModule } from "../src/PredmartLeverageModule.sol";
 
 /// @title Deploy
@@ -28,6 +29,8 @@ contract Deploy is Script {
         address usdc;
         address ctf;
         address lendingPoolProxy;
+        address pusd;
+        address collateralOnramp;
     }
 
     /// @notice Get config based on chain ID (auto-detected from RPC)
@@ -37,7 +40,9 @@ contract Deploy is Script {
             return Config({
                 usdc: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174, // USDC.e
                 ctf: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045, // Polymarket CTF
-                lendingPoolProxy: 0xD90D012990F0245cAD29823bDF0B4C9AF207d9ee
+                lendingPoolProxy: 0xD90D012990F0245cAD29823bDF0B4C9AF207d9ee,
+                pusd: 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB,                  // Polymarket V2 pUSD
+                collateralOnramp: 0x93070a847efEf7F70739046A929D47a521F5B8ee       // Polymarket V2 wrap
             });
         } else {
             revert("Unsupported chain");
@@ -92,6 +97,29 @@ contract Deploy is Script {
     /*//////////////////////////////////////////////////////////////
                         UPGRADE LENDING POOL
     //////////////////////////////////////////////////////////////*/
+
+    /// @notice Deploy ONLY a new extension (no pool main change). Use when the upgrade is
+    ///         pure-extension logic (e.g. expire-permission tweaks). Wire via the existing
+    ///         proposeExtension + executeExtension Safe flow — no reinitializer needed.
+    /// @dev forge script script/Deploy.s.sol --sig "deployExtensionOnly()" --rpc-url polygon_mainnet --broadcast --verify
+    function deployExtensionOnly() external {
+        uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
+
+        console.log("=== DEPLOY EXTENSION ONLY ===");
+        console.log("Network:", _getNetworkName());
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        PredmartPoolExtension newExt = new PredmartPoolExtension();
+
+        vm.stopBroadcast();
+
+        console.log("New extension:", address(newExt));
+        console.log("");
+        console.log("=== NEXT STEPS (via Gnosis Safe UI) ===");
+        console.log("1. proposeExtension(<new ext>) on the proxy -- starts 6h timelock");
+        console.log("2. After 6h: executeExtension() on the proxy");
+    }
 
     /// @notice Deploy new impl + extension only (no proposeAddress — use when admin is a Safe)
     /// @dev forge script script/Deploy.s.sol --sig "deployUpgrade()" --rpc-url polygon_mainnet --broadcast --verify
@@ -233,7 +261,9 @@ contract Deploy is Script {
         PredmartLeverageModule module = new PredmartLeverageModule(
             cfg.lendingPoolProxy,
             relayerAddr,
-            cfg.usdc
+            cfg.usdc,
+            cfg.pusd,
+            cfg.collateralOnramp
         );
 
         console.log("=== LEVERAGE MODULE DEPLOYED ===");
@@ -241,7 +271,9 @@ contract Deploy is Script {
         console.log("Version:", module.VERSION());
         console.log("Lending Pool:", module.LENDING_POOL());
         console.log("Relayer:", module.RELAYER());
-        console.log("USDC:", module.USDC());
+        console.log("USDC.e:", module.USDC_E());
+        console.log("pUSD:", module.PUSD());
+        console.log("CollateralOnramp:", module.COLLATERAL_ONRAMP());
         console.logBytes32(module.POOL_DOMAIN_SEPARATOR());
 
         vm.stopBroadcast();
@@ -253,41 +285,84 @@ contract Deploy is Script {
     }
 
     /*//////////////////////////////////////////////////////////////
-                  DEPLOY UPGRADE WITH MODULE (Path B)
+                 DEPLOY V2-NATIVE UPGRADE (3 contracts + module)
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Deploy new pool implementation + extension + leverage module.
-    ///         The Safe upgrade tx then calls upgradeToAndCall(newImpl, initializeV17(ext, module)).
+    /// @notice Deploy new pool implementation + PoolExtension + BorrowExtension + leverage module.
+    ///         The Safe upgrade tx then calls upgradeToAndCall(newImpl, initializeV19(...)),
+    ///         which sets the leverage module and populates the selector → extension routing
+    ///         mapping for the BorrowExtension functions.
     /// @dev forge script script/Deploy.s.sol --sig "deployUpgradeWithModule()" --rpc-url polygon_mainnet --broadcast --verify
     function deployUpgradeWithModule() external {
         Config memory cfg = _getConfig();
         uint256 deployerPrivateKey = vm.envUint("RELAYER_PRIVATE_KEY");
         address relayerAddr = vm.addr(deployerPrivateKey);
 
-        console.log("=== DEPLOY UPGRADE + MODULE (Path B) ===");
+        console.log("=== DEPLOY V2-NATIVE UPGRADE (impl + 2 extensions + module) ===");
         console.log("Network:", _getNetworkName());
 
         vm.startBroadcast(deployerPrivateKey);
 
-        PredmartPoolExtension newExt = new PredmartPoolExtension();
+        PredmartPoolExtension newPoolExt = new PredmartPoolExtension();
+        PredmartBorrowExtension newBorrowExt = new PredmartBorrowExtension();
         PredmartLendingPool newImpl = new PredmartLendingPool();
         PredmartLeverageModule module = new PredmartLeverageModule(
             cfg.lendingPoolProxy,
             relayerAddr,
-            cfg.usdc
+            cfg.usdc,
+            cfg.pusd,
+            cfg.collateralOnramp
         );
 
         vm.stopBroadcast();
 
-        console.log("New extension:    ", address(newExt));
-        console.log("New implementation:", address(newImpl));
-        console.log("New module:       ", address(module));
-        console.log("Module VERSION:   ", module.VERSION());
+        // Selectors routed to BorrowExtension. Anything not in this list falls back to the
+        // PoolExtension (the default `extension` slot), so we leave _poolSelectors empty.
+        bytes4[] memory borrowSelectors = new bytes4[](5);
+        borrowSelectors[0] = PredmartBorrowExtension.borrowViaRelay.selector;
+        borrowSelectors[1] = PredmartBorrowExtension.leverageDeposit.selector;
+        borrowSelectors[2] = PredmartBorrowExtension.depositCollateralFrom.selector;
+        borrowSelectors[3] = PredmartBorrowExtension.withdrawViaRelay.selector;
+        borrowSelectors[4] = PredmartBorrowExtension.pullUsdcForLeverage.selector;
+
+        bytes4[] memory poolSelectors = new bytes4[](0);
+
+        bytes memory upgradeCalldata = abi.encodeWithSignature(
+            "initializeV19(address,address,address,bytes4[],bytes4[])",
+            address(newPoolExt),
+            address(newBorrowExt),
+            address(module),
+            poolSelectors,
+            borrowSelectors
+        );
+
+        console.log("New PoolExtension:   ", address(newPoolExt));
+        console.log("New BorrowExtension: ", address(newBorrowExt));
+        console.log("New implementation:  ", address(newImpl));
+        console.log("New module:          ", address(module));
+        console.log("Module VERSION:      ", module.VERSION());
+        console.log("");
+        console.log("Borrow selectors (routed to BorrowExtension):");
+        console.log("  borrowViaRelay:        ");
+        console.logBytes4(borrowSelectors[0]);
+        console.log("  leverageDeposit:       ");
+        console.logBytes4(borrowSelectors[1]);
+        console.log("  depositCollateralFrom: ");
+        console.logBytes4(borrowSelectors[2]);
+        console.log("  withdrawViaRelay:      ");
+        console.logBytes4(borrowSelectors[3]);
+        console.log("  pullUsdcForLeverage:   ");
+        console.logBytes4(borrowSelectors[4]);
+        console.log("");
+        console.log("=== UPGRADE CALLDATA (paste into Safe upgradeToAndCall) ===");
+        console.logBytes(upgradeCalldata);
         console.log("");
         console.log("=== NEXT STEPS (via Gnosis Safe UI) ===");
-        console.log("1. proposeAddress(2, <new impl>) on extension -- starts 6h timelock");
-        console.log("2. After 6h: upgradeToAndCall(<new impl>, initializeV17(<new ext>, <module>))");
-        console.log("3. Verify: leverageModule() returns module address; module.VERSION() returns 2.0.0");
+        console.log("1. proposeAddress(2, <new impl>) on the proxy -- starts 6h timelock");
+        console.log("2. After 6h: upgradeToAndCall(<new impl>, <upgrade calldata above>)");
+        console.log("3. Verify: leverageModule() == <new module>; module.VERSION() == 2.0.0");
+        console.log("4. Verify: extension() == <new PoolExtension>");
+        console.log("5. Verify: extensionForSelector(borrowViaRelay.selector) == <new BorrowExtension>");
     }
 
     /*//////////////////////////////////////////////////////////////

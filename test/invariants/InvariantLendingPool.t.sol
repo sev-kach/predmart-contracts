@@ -8,6 +8,7 @@ import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/Mes
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { PredmartLendingPool } from "../../src/PredmartLendingPool.sol";
 import { PredmartPoolExtension } from "../../src/PredmartPoolExtension.sol";
+import { PredmartBorrowExtension } from "../../src/PredmartBorrowExtension.sol";
 import { PredmartOracle } from "../../src/PredmartOracle.sol";
 import { MockUSDC } from "../mocks/MockUSDC.sol";
 import { MockCTF } from "../mocks/MockCTF.sol";
@@ -18,6 +19,7 @@ import { MockCTF } from "../mocks/MockCTF.sol";
 contract Handler is Test {
     PredmartLendingPool public pool;
     PredmartPoolExtension public poolAdmin;
+    PredmartBorrowExtension public poolBorrow;
     MockUSDC public usdc;
     MockCTF public ctf;
 
@@ -39,7 +41,7 @@ contract Handler is Test {
     uint256 public ghost_totalFeesCollected;
 
     bytes32 public constant BORROW_INTENT_TYPEHASH = keccak256(
-        "BorrowIntent(address borrower,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
+        "BorrowIntent(address borrower,address recipient,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
     );
     bytes32 public constant WITHDRAW_INTENT_TYPEHASH = keccak256(
         "WithdrawIntent(address borrower,address to,uint256 tokenId,uint256 amount,uint256 nonce,uint256 deadline)"
@@ -59,6 +61,7 @@ contract Handler is Test {
     ) {
         pool = _pool;
         poolAdmin = _poolAdmin;
+        poolBorrow = PredmartBorrowExtension(address(_pool));
         usdc = _usdc;
         ctf = _ctf;
         admin = _admin;
@@ -101,32 +104,32 @@ contract Handler is Test {
 
         vm.startPrank(borrower);
         ctf.setApprovalForAll(address(pool), true);
-        poolAdmin.depositCollateral(TOKEN_ID, amount, _signPrice(TOKEN_ID, PRICE));
+        poolAdmin.depositCollateral(borrower, TOKEN_ID, amount, _signPrice(TOKEN_ID, PRICE));
         vm.stopPrank();
     }
 
     /// @notice Borrower borrows via relay
     function borrow(uint256 amount) external {
         amount = bound(amount, 1e6, 20e6); // $1 to $20
-        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 collateral,,,,,) = pool.positions(borrower, TOKEN_ID);
         if (collateral == 0) return;
 
         uint256 nonce = pool.borrowNonces(borrower);
         uint256 deadline = block.timestamp + 300;
 
         bytes32 structHash = keccak256(
-            abi.encode(BORROW_INTENT_TYPEHASH, borrower, TOKEN_ID, amount, nonce, deadline)
+            abi.encode(BORROW_INTENT_TYPEHASH, borrower, borrower, TOKEN_ID, amount, nonce, deadline)
         );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(borrowerPrivateKey, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
-        PredmartLendingPool.BorrowIntent memory intent = PredmartLendingPool.BorrowIntent({
-            borrower: borrower, tokenId: TOKEN_ID, amount: amount, nonce: nonce, deadline: deadline
+        PredmartBorrowExtension.BorrowIntent memory intent = PredmartBorrowExtension.BorrowIntent({
+            borrower: borrower, recipient: borrower, tokenId: TOKEN_ID, amount: amount, nonce: nonce, deadline: deadline
         });
 
         vm.prank(relayer);
-        try pool.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID, PRICE)) {
+        try poolBorrow.borrowViaRelay(intent, sig, _signPrice(TOKEN_ID, PRICE)) {
             ghost_totalBorrowed += amount;
         } catch {}
     }
@@ -140,7 +143,7 @@ contract Handler is Test {
 
         vm.startPrank(borrower);
         usdc.approve(address(pool), amount);
-        poolAdmin.repay(TOKEN_ID, amount);
+        poolAdmin.repay(borrower, TOKEN_ID, amount);
         vm.stopPrank();
 
         ghost_totalRepaid += amount;
@@ -148,7 +151,7 @@ contract Handler is Test {
 
     /// @notice Borrower withdraws collateral via relay
     function withdrawCollateral(uint256 amount) external {
-        (uint256 collateral,,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 collateral,,,,,) = pool.positions(borrower, TOKEN_ID);
         if (collateral == 0) return;
         amount = bound(amount, 1, collateral);
 
@@ -162,12 +165,12 @@ contract Handler is Test {
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(borrowerPrivateKey, digest);
         bytes memory sig = abi.encodePacked(r, s, v);
 
-        PredmartLendingPool.WithdrawIntent memory intent = PredmartLendingPool.WithdrawIntent({
+        PredmartBorrowExtension.WithdrawIntent memory intent = PredmartBorrowExtension.WithdrawIntent({
             borrower: borrower, to: borrower, tokenId: TOKEN_ID, amount: amount, nonce: nonce, deadline: deadline
         });
 
         vm.prank(relayer);
-        try pool.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID, PRICE)) {} catch {}
+        try poolBorrow.withdrawViaRelay(intent, sig, _signPrice(TOKEN_ID, PRICE)) {} catch {}
     }
 
     /// @notice Time passes — triggers interest accrual
@@ -366,7 +369,7 @@ contract InvariantLendingPoolTest is Test {
     /// @notice Pool's CTF balance must be >= sum of all tracked collateral + fee shares
     function invariant_ctfBalanceCoversPositions() public view {
         uint256 poolCTFBalance = ctf.balanceOf(address(pool), TOKEN_ID);
-        (uint256 borrowerCollateral,,,,) = pool.positions(borrower, TOKEN_ID);
+        (uint256 borrowerCollateral,,,,,) = pool.positions(borrower, TOKEN_ID);
         uint256 feeShares = pool.feeSharesAccumulated(TOKEN_ID);
 
         // Pool must hold at least enough CTF for all positions + accumulated fee shares
